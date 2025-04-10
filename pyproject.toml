@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "srmudp"
+version = "0.1.0"
+description = "Secure Reliable Multi UDP communication framework"
+authors = ["riddim"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pycryptodome = "^3.22.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

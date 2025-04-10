@@ -46,8 +46,7 @@ import socket as s
 import threading
 import logging
 import atexit
-import ecdsa
-import os
+from Cryptodome.PublicKey import ECC
 
 
 log = logging.getLogger(__name__)
@@ -190,7 +189,7 @@ class SecureReliableSocket(socket):
         "_timeout", "span", "address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket_optional", "sender_time",
         "receiver_seq", "receiver_unread_size", "receiver_socket",
-        "broadcast_hook_fnc", "loss", "try_connect", "established"]
+        "broadcast_hook_fnc", "loss", "try_connect", "established", "_stop_reconnect", "_reconnect_thread"]
 
     def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
         """
@@ -232,6 +231,8 @@ class SecureReliableSocket(socket):
         self.loss = 0
         self.try_connect = False
         self.established = False
+        self._stop_reconnect = threading.Event()
+        self._reconnect_thread = None
 
     def __repr__(self) -> str:
         if self.is_closed:
@@ -248,15 +249,52 @@ class SecureReliableSocket(socket):
     def bind(self, _address: '_WildAddress') -> None:
         raise NotImplementedError("don't use bind() method")
 
+    def is_connected(self) -> bool:
+        """Check if the connection is established"""
+        return self.established and not self.is_closed
+        
     def connect(self, address: '_WildAddress') -> None:
-        """throw hole-punch msg, listen port and exchange keys"""
+        """
+        Throw hole-punch msg, listen port and exchange keys.
+        This starts a connection attempt that continues indefinitely until close() is called.
+        """
+        assert not self.is_closed, "already closed socket"
+        
+        # Set address for reconnection
+        self.address = address
+        
+        # Start reconnection thread
+        self._stop_reconnect.clear()
+        self._reconnect_thread = threading.Thread(target=self._reconnect_loop, name="SRUDP-Reconnect", daemon=True)
+        self._reconnect_thread.start()
+        
+    def _reconnect_loop(self) -> None:
+        """
+        Continuously try to establish or re-establish connection until stopped
+        """
+        while not self._stop_reconnect.is_set():
+            if not self.established and not self.try_connect:
+                try:
+                    self._connect_once(self.address)
+                except (ConnectionError, OSError) as e:
+                    log.debug("Connection attempt failed: %s. Retrying in %s seconds.", e, self.span)
+                    self.try_connect = False
+                    time.sleep(self.span)
+            else:
+                # Already connected or attempting to connect, just wait
+                time.sleep(self.span)
+    
+    def _connect_once(self, address: '_WildAddress') -> None:
+        """Single attempt to establish connection"""
         assert not self.established, "already established"
         assert not self.is_closed, "already closed socket"
-        assert not self.try_connect, "already try to connect"
-
-        # start communication (only once you can try)
+        
+        # Reset connection state
         self.try_connect = True
-
+        self.shared_key = None
+        self.sender_seq = CycInt(1)
+        self.receiver_seq = CycInt(1)
+        
         # bind socket address
         conn_addr = list(get_formal_address_format(address, self.family))
         bind_addr = conn_addr.copy()
@@ -270,37 +308,50 @@ class SecureReliableSocket(socket):
                 another_port += 1  # use 2n if 2n+1 is used
             # another socket is on the same PC and can bind only one
             try:
+                # Close previous socket if exists
+                if hasattr(self, 'receiver_socket') and self.receiver_socket:
+                    self.receiver_socket.close()
+                self.receiver_socket = socket(self.family, s.SOCK_DGRAM)
                 self.receiver_socket.bind(tuple(bind_addr))
                 conn_addr[1] = another_port
             except OSError:
                 # note: this raise OSError if already bind
                 # unexpected: this raise OSError if CLOSE_WAIT state
                 bind_addr[1] = another_port
+                if hasattr(self, 'receiver_socket') and self.receiver_socket:
+                    self.receiver_socket.close()
+                self.receiver_socket = socket(self.family, s.SOCK_DGRAM)
                 self.receiver_socket.bind(tuple(bind_addr))
+            
+            if hasattr(self, 'sender_socket_optional') and self.sender_socket_optional:
+                self.sender_socket_optional.close()
             self.sender_socket_optional = socket(self.family, s.SOCK_DGRAM)
         else:
             # global
             bind_addr[0] = ""
+            if hasattr(self, 'receiver_socket') and self.receiver_socket:
+                self.receiver_socket.close()
+            self.receiver_socket = socket(self.family, s.SOCK_DGRAM)
             self.receiver_socket.bind(tuple(bind_addr))
 
         self.address = address = tuple(conn_addr)
-        log.debug("try to communicate addr={} bind={}".format(address, bind_addr))
+        log.debug("try to communicate addr=%s bind=%s", address, bind_addr)
 
         # warning: allow only 256bit curve
-        select_curve = ecdsa.curves.NIST256p
-        log.debug("select curve {} (static)".format(select_curve))
-        assert select_curve.baselen == 32, ("curve is 256bits size only", select_curve)
+        select_curve = ECC.generate(curve='P-256')
+        log.debug("select curve %s (static)", select_curve)
+        assert select_curve.curve == 'P-256', ("curve is 256bits size only", select_curve)
 
         # 1. UDP hole punching
         punch_msg = b"udp hole punching"
-        self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.name.encode(), address)
+        self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.curve.encode(), address)
 
         # my secret & public key
-        my_sk = ecdsa.SigningKey.generate(select_curve)
-        my_pk = my_sk.get_verifying_key()
+        my_sk = ECC.generate(curve='P-256')
+        my_pk = my_sk.export_key(format='DER')
 
         # other's public key
-        other_pk: Optional[ecdsa.VerifyingKey] = None
+        other_pk: Optional[ECC.EccKey] = None
 
         check_msg = b"success hand shake"
         for _ in range(int(self._timeout / self.span)):
@@ -313,31 +364,31 @@ class SecureReliableSocket(socket):
                     # 2. send my public key
                     curve_name = data.replace(punch_msg, b'').decode()
                     other_curve = find_ecdhe_curve(curve_name)
-                    assert select_curve == other_curve, ("different curve", select_curve, other_curve)
+                    assert select_curve.curve == other_curve.curve, ("different curve", select_curve, other_curve)
                     select_curve = find_ecdhe_curve(curve_name)
-                    self.sendto(S_SEND_PUBLIC_KEY + my_pk.to_string(), address)
+                    self.sendto(S_SEND_PUBLIC_KEY + my_pk, address)
                     log.debug("success UDP hole punching")
 
                 elif stage == S_SEND_PUBLIC_KEY:
                     # 3. get public key & send shared key
-                    other_pk = ecdsa.VerifyingKey.from_string(data, select_curve)
-                    shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
+                    other_pk = ECC.import_key(data)
+                    shared_point = ECC.multiply(my_sk, other_pk.pointQ())
                     self.shared_key = sha256(int(shared_point.x()).to_bytes(32, 'big')).digest()
-                    shared_key = os.urandom(32)
-                    encrypted_data = my_pk.to_string().hex() + "+" + self._encrypt(shared_key).hex()
+                    shared_key = ECC.generate(curve='P-256').generate(curve='P-256').export_key(format='DER')
+                    encrypted_data = ECC.encrypt(my_pk, shared_key)
                     self.shared_key = shared_key
-                    self.sendto(S_SEND_SHARED_KEY + encrypted_data.encode(), address)
+                    self.sendto(S_SEND_SHARED_KEY + encrypted_data, address)
                     log.debug("success getting shared key")
 
                 elif stage == S_SEND_SHARED_KEY:
                     # 4. decrypt shared key & send hello msg
-                    encrypted_data = data.decode().split("+")
+                    encrypted_data = ECC.decrypt(other_pk, data)
                     if other_pk is None:
-                        other_pk = ecdsa.VerifyingKey.from_string(a2b_hex(encrypted_data[0]), select_curve)
+                        other_pk = ECC.import_key(encrypted_data)
                     else:
                         log.debug("need to check priority because already get others's pk")
-                        my_pri = sha256(my_pk.to_string() + other_pk.to_string()).digest()
-                        other_pri = sha256(other_pk.to_string() + my_pk.to_string()).digest()
+                        my_pri = ECC.multiply(my_sk, other_pk.pointQ()).x()
+                        other_pri = ECC.multiply(other_pk, my_sk.pointQ()).x()
                         # check 256bit int as big-endian
                         if my_pri < other_pri:
                             log.debug("my priority is LOW and over write my shared key by other's")
@@ -348,16 +399,16 @@ class SecureReliableSocket(socket):
                             raise ConnectionError("my and other's key is same, this means you connect to yourself")
                     if my_sk is None:
                         raise ConnectionError("not found my_sk")
-                    shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
+                    shared_point = ECC.multiply(my_sk, other_pk.pointQ())
                     self.shared_key = sha256(int(shared_point.x()).to_bytes(32, 'big')).digest()
-                    self.shared_key = self._decrypt(a2b_hex(encrypted_data[1]))
-                    self.sendto(S_ESTABLISHED + self._encrypt(check_msg), address)
+                    self.shared_key = ECC.decrypt(other_pk, encrypted_data)
+                    self.sendto(S_ESTABLISHED + ECC.encrypt(my_pk, check_msg), address)
                     log.debug("success decrypt shared key")
                     break
 
                 elif stage == S_ESTABLISHED:
                     # 5. check establish by decrypt specific message
-                    decrypt_msg = self._decrypt(data)
+                    decrypt_msg = ECC.decrypt(other_pk, data)
                     if decrypt_msg != check_msg:
                         raise ConnectionError("failed to check")
                     log.debug("success hand shaking")
@@ -456,9 +507,10 @@ class SecureReliableSocket(socket):
 
             # connection may be broken
             if self._timeout < time() - last_receive_time:
-                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
-                break
+                log.debug("Connection seems broken, marking as disconnected")
+                self.established = False
+                # Instead of breaking, exit this backend thread
+                return
 
             # just socket select timeout (no data received yet)
             if len(r) == 0:
@@ -479,10 +531,12 @@ class SecureReliableSocket(socket):
                 # log.debug("decrypt failed len=%s..".format(data[:10]))
                 continue
             except (ConnectionResetError, OSError):
-                break
+                self.established = False
+                return  # Exit thread to trigger reconnection
             except Exception:
                 log.error("UDP socket closed", exc_info=True)
-                break
+                self.established = False
+                return  # Exit thread to trigger reconnection
 
             # receive ack
             if packet.control & CONTROL_ACK:
@@ -495,14 +549,14 @@ class SecureReliableSocket(socket):
                                 break
                         if not self._send_buffer_is_full():
                             self.sender_signal.set()
-                            log.debug("allow sending operation again seq={}".format(packet.sequence))
+                            log.debug("allow sending operation again seq=%s", packet.sequence)
                 continue
 
             # receive reset
             if packet.control & CONTROL_FIN:
-                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'be notified fin or reset')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
-                break
+                log.debug("Received FIN, connection closed by peer")
+                self.established = False
+                return  # Exit thread to trigger reconnection
 
             # asked re-transmission
             if packet.control & CONTROL_RTM:
@@ -764,21 +818,41 @@ class SecureReliableSocket(socket):
         return False
 
     def close(self) -> None:
+        """Close the connection and stop reconnection attempts"""
+        self._stop_reconnect.set()  # Stop reconnection attempts
+        
         if self.established:
             self.established = False
             p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'closed')
-            self.sendto(self._encrypt(packet2bin(p)), self.address)
-            self.receiver_socket.close()
+            try:
+                self.sendto(self._encrypt(packet2bin(p)), self.address)
+            except Exception:
+                pass  # Ignore errors during close
+                
+        if hasattr(self, 'receiver_socket') and self.receiver_socket:
+            try:
+                self.receiver_socket.close()
+            except Exception:
+                pass
+                
+        try:
             super().close()
-            if self.sender_socket_optional is not None:
+        except Exception:
+            pass
+            
+        if hasattr(self, 'sender_socket_optional') and self.sender_socket_optional:
+            try:
                 self.sender_socket_optional.close()
-            atexit.unregister(self.close)
+            except Exception:
+                pass
+                
+        atexit.unregister(self.close)
 
 
-def find_ecdhe_curve(curve_name: str) -> ecdsa.curves.Curve:
-    for curve in ecdsa.curves.curves:
-        if curve.name == curve_name:
-            return curve
+def find_ecdhe_curve(curve_name: str) -> ECC.EccKey:
+    for curve in ECC._curves:
+        if curve == curve_name:
+            return ECC.generate(curve=curve)
     else:
         raise ConnectionError("unknown curve {}".format(curve_name))
 

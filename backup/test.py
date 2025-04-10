@@ -1,4 +1,4 @@
-from srudp import SecureReliableSocket, Packet
+from srmudp import SecureReliableSocket, Packet
 from concurrent.futures import ThreadPoolExecutor
 from time import sleep
 import socket as s
