@@ -17,25 +17,22 @@ Features
 #### Communication Flow:
 
 ```mermaid
-graph TD;
-    A[Client A] -->|udp-hole-punching| B[Client B];
-    B -->|udp-hole-punching (fail)| A;
-    B -->|send B's publicKey| A;
-    A -->|send sharedKey (encrypted by sharedPoint)| B;
-    B -->|send establish flag (encrypted by sharedKey)| A;
-    A -->|A established| B;
-    B -->|B established| A;
+sequenceDiagram
+    participant A as Client A
+    participant B as Client B
+    A->>B: udp-hole-punching
+    B->>A: udp-hole-punching (fail)
+    B->>A: send B's publicKey
+    A->>B: send sharedKey (encrypted by sharedPoint)
+    B->>A: send establish flag (encrypted by sharedKey) 
+    A->>B: A established
+    B->>A: B established
 ```
 
 planned Features (/ideas to investigate)
 ----
 
 - gossip protocol on massive-multi-user connections? (not because of the traffic but because of the connection count)
-
-
-
-
-
 
 - explicit data-routing through other participant; signature based "connect via" if for some reason not everyone can connect to everyone but "everyone is connected to someone"
     - possibility to add a "gate" to a chat/user. The Gate is port-forwarded/an exposed host/port and doesn't require hole-punching. It can be attached to a chat/might come with a participant and users try to hole-punch as default communication route. If that connection doesn't work sending to others via the gate is the fallback communication option. (combined with the "connect via" -> a user having a Gate entering a multi-user-chat allows everyone to talk to everyone else even if hole-punch would fail for all other participants [as long as outgoing connections to the gate don't get blocked])
