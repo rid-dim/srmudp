@@ -33,13 +33,13 @@ note
 * sharedPoint is calculated by multiply secretKey with publicKey.
 * sharedKey is random 256bit bytes, don't use sharedPoint as sharedKey.
 """
-from typing import TYPE_CHECKING, NamedTuple, Optional, Union, Deque, Tuple, Dict, Callable, Any
+from typing import TYPE_CHECKING, NamedTuple, Optional, Union, Deque, Tuple, Dict, Callable, Any, Sized
 from select import select
 from time import sleep, time
 from collections import deque
 from hashlib import sha256
 from binascii import a2b_hex
-from Cryptodome.Cipher import AES
+from Crypto.Cipher import AES
 from struct import Struct
 from socket import socket
 import socket as s
@@ -91,7 +91,7 @@ S_ESTABLISHED = b'\x03'
 
 # typing
 if TYPE_CHECKING:
-    from Cryptodome.Cipher._mode_gcm import GcmMode
+    from Crypto.Cipher._mode_gcm import GcmMode
     from _typeshed import ReadableBuffer
     from typing import Sized
     _Address = Tuple[Any, ...]
@@ -611,8 +611,12 @@ class SecureReliableSocket(socket):
         """just append new data to buffer"""
         if self.fileno() == -1:
             return  # already closed
-        super().sendall(data)
-        self.receiver_unread_size += len(data)
+        try:
+            super().sendall(data)
+            self.receiver_unread_size += len(data)
+        except (OSError, ConnectionError):
+            # Socket might have been closed
+            pass
 
     def _send_buffer_is_full(self) -> bool:
         assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
