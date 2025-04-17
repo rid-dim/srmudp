@@ -48,9 +48,16 @@ import logging
 import atexit
 import ecdsa
 import os
+import zmq
 
 
 log = logging.getLogger(__name__)
+# Define a struct for packet representation
+# <BIBd means:
+# B  - 1 byte for control flags
+# I  - 4 bytes for sequence number (unsigned int) (so a ~6TB max file size? #TODO: check)
+# B  - 4 bytes for retry count (unsigned int)
+# d  - 8 bytes for timestamp (double)
 packet_struct = Struct("<BIBd")
 
 CONTROL_ACK = 0b00000001  # Acknowledge
@@ -167,30 +174,38 @@ class Packet(NamedTuple):
 
 
 def bin2packet(b: bytes) -> 'Packet':
+    # control, sequence, retry, time
     c, seq, r, t = packet_struct.unpack_from(b)
+    # Packet(control, sequence, retry, time, data)
     return Packet(c, CycInt(seq), r, t, b[packet_struct.size:])
 
 
 def packet2bin(p: Packet) -> bytes:
     # log.debug("s>> %s", p)
+    # Packet => binary data
     return packet_struct.pack(p.control, int(p.sequence), p.retry, p.time) + p.data
 
 
 def get_formal_address_format(address: '_WildAddress', family: int = s.AF_INET) -> '_Address':
     """tuple of ipv4/6 correct address format"""
     assert isinstance(address, tuple), "cannot recognize bytes or str format"
+
+    # getaddrinfo() returns a list of tuples, each containing:
+    # (family, socktype, proto, canonname, sa_addr)
+    # sa_addr is a tuple (address, port)
     for _, _, _, _, addr in s.getaddrinfo(str(address[0]), int(address[1]), family, s.SOCK_STREAM):
         return addr
     else:
         raise ConnectionError("not found correct ip format of {}".format(address))
 
 
-class SecureReliableSocket(socket):
+class SecureReliableSocket():
     __slots__ = [
         "_timeout", "span", "address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket_optional", "sender_time",
-        "receiver_seq", "receiver_unread_size", "receiver_socket",
-        "broadcast_hook_fnc", "loss", "try_connect", "established"]
+        "receiver_seq", "receiver_unread_size", "receiver_socket", "zmq_context", "zmq_push", "zmq_pull", "zmq_endpoint",
+        "broadcast_hook_fnc", "loss", "try_connect", "established", "family", "message_buffer"
+    ]
 
     def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
         """
@@ -198,11 +213,38 @@ class SecureReliableSocket(socket):
         :param timeout: auto socket close by the time passed (sec)
         :param span: check socket status by the span (sec)
         """
-        # self bind buffer
-        super().__init__(family, s.SOCK_STREAM)
-        super().bind(("127.0.0.1" if family == s.AF_INET else "::1", 0))
-        self_address = super().getsockname()
-        super().connect(self_address)
+    
+        self.zmq_context = zmq.Context.instance()
+        
+        # Create a unique identifier for this socket instance
+        socket_id = id(self)
+        self.zmq_endpoint = f"inproc://srudp-internal-{socket_id}"
+        
+        # Create PUSH/PULL sockets instead of PUB/SUB for better message handling
+        self.zmq_push = self.zmq_context.socket(zmq.PUSH)
+        # Wichtig: SNDHWM auf 0 setzen, damit keine Nachrichten verloren gehen
+        self.zmq_push.setsockopt(zmq.SNDHWM, 0)
+        self.zmq_push.bind(self.zmq_endpoint)
+        
+        self.zmq_pull = self.zmq_context.socket(zmq.PULL)
+        # Wichtig: RCVHWM auf 0 setzen, damit keine Nachrichten verloren gehen
+        self.zmq_pull.setsockopt(zmq.RCVHWM, 0) 
+        self.zmq_pull.connect(self.zmq_endpoint)
+        
+        # Sofortiges Beenden beim Schließen aktivieren
+        self.zmq_push.setsockopt(zmq.LINGER, 0)
+        self.zmq_pull.setsockopt(zmq.LINGER, 0)
+        
+        # Weitere wichtige Socket-Optionen für bessere Integration mit asyncio
+        # IPV6 aktivieren, falls unterstützt
+        if hasattr(zmq, 'IPV6'):
+            try:
+                self.zmq_pull.setsockopt(zmq.IPV6, 1)
+            except zmq.ZMQError:
+                log.info("IPV6 not supported")
+            
+        log.debug(f"ZeroMQ PUSH/PULL sockets created for internal communication at {self.zmq_endpoint}")
+
 
         # inner params
         self._timeout = timeout
@@ -214,7 +256,7 @@ class SecureReliableSocket(socket):
 
         # sender params
         self.sender_seq = CycInt(1)  # next send sequence
-        self.sender_buffer: Deque[Packet] = deque()
+        self.sender_buffer: Deque[Packet] = deque() # deque is a double-ended queue that allows appending and popping from both ends efficiently.
         self.sender_signal = threading.Event()  # clear when buffer is empty
         self.sender_buffer_lock = threading.Lock()
         self.sender_socket_optional: Optional[socket] = None
@@ -223,6 +265,8 @@ class SecureReliableSocket(socket):
         self.receiver_seq = CycInt(1)  # next receive sequence
         self.receiver_unread_size = 0
         self.receiver_socket = socket(family, s.SOCK_DGRAM)
+        # Buffer für die Zusammenstellung kompletter Nachrichten
+        self.message_buffer = bytearray()
 
         # broadcast hook
         # note: don't block this method or backend thread will be broken
@@ -245,9 +289,6 @@ class SecureReliableSocket(socket):
         return "<SecureReliableSocket %s %s send=%s recv=%s loss=%s>"\
                % (status, self.address, self.sender_seq, self.receiver_seq, self.loss)
 
-    def bind(self, _address: '_WildAddress') -> None:
-        raise NotImplementedError("don't use bind() method")
-
     def connect(self, address: '_WildAddress') -> None:
         """throw hole-punch msg, listen port and exchange keys"""
         assert not self.established, "already established"
@@ -257,134 +298,144 @@ class SecureReliableSocket(socket):
         # start communication (only once you can try)
         self.try_connect = True
 
-        # bind socket address
-        conn_addr = list(get_formal_address_format(address, self.family))
-        bind_addr = conn_addr.copy()
+        try:
+            # bind socket address
+            conn_addr = list(get_formal_address_format(address))
+            bind_addr = conn_addr.copy()
 
-        if conn_addr[0] in ("127.0.0.1", "::1"):
-            # local (for debug)
-            another_port = conn_addr[1]
-            if another_port % 2:
-                another_port -= 1  # use 2n+1 if 2n is used
-            else:
-                another_port += 1  # use 2n if 2n+1 is used
-            # another socket is on the same PC and can bind only one
-            try:
-                self.receiver_socket.bind(tuple(bind_addr))
-                conn_addr[1] = another_port
-            except OSError:
-                # note: this raise OSError if already bind
-                # unexpected: this raise OSError if CLOSE_WAIT state
-                bind_addr[1] = another_port
-                self.receiver_socket.bind(tuple(bind_addr))
-            self.sender_socket_optional = socket(self.family, s.SOCK_DGRAM)
-        else:
-            # global
-            bind_addr[0] = ""
-            self.receiver_socket.bind(tuple(bind_addr))
+            if conn_addr[0] in ("127.0.0.1", "::1"):
 
-        self.address = address = tuple(conn_addr)
-        log.debug("try to communicate addr={} bind={}".format(address, bind_addr))
-
-        # warning: allow only 256bit curve
-        select_curve = ecdsa.curves.NIST256p
-        log.debug("select curve {} (static)".format(select_curve))
-        assert select_curve.baselen == 32, ("curve is 256bits size only", select_curve)
-
-        # 1. UDP hole punching
-        punch_msg = b"udp hole punching"
-        self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.name.encode(), address)
-
-        # my secret & public key
-        my_sk = ecdsa.SigningKey.generate(select_curve)
-        my_pk = my_sk.get_verifying_key()
-
-        # other's public key
-        other_pk: Optional[ecdsa.VerifyingKey] = None
-
-        check_msg = b"success hand shake"
-        for _ in range(int(self._timeout / self.span)):
-            r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
-            if r:
-                data, _addr = self.receiver_socket.recvfrom(1024)
-                stage, data = data[:1], data[1:]
-
-                if stage == S_HOLE_PUNCHING:
-                    # 2. send my public key
-                    curve_name = data.replace(punch_msg, b'').decode()
-                    other_curve = find_ecdhe_curve(curve_name)
-                    assert select_curve == other_curve, ("different curve", select_curve, other_curve)
-                    select_curve = find_ecdhe_curve(curve_name)
-                    self.sendto(S_SEND_PUBLIC_KEY + my_pk.to_string(), address)
-                    log.debug("success UDP hole punching")
-
-                elif stage == S_SEND_PUBLIC_KEY:
-                    # 3. get public key & send shared key
-                    other_pk = ecdsa.VerifyingKey.from_string(data, select_curve)
-                    shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
-                    self.shared_key = sha256(int(shared_point.x()).to_bytes(32, 'big')).digest()
-                    shared_key = os.urandom(32)
-                    encrypted_data = my_pk.to_string().hex() + "+" + self._encrypt(shared_key).hex()
-                    self.shared_key = shared_key
-                    self.sendto(S_SEND_SHARED_KEY + encrypted_data.encode(), address)
-                    log.debug("success getting shared key")
-
-                elif stage == S_SEND_SHARED_KEY:
-                    # 4. decrypt shared key & send hello msg
-                    encrypted_data = data.decode().split("+")
-                    if other_pk is None:
-                        other_pk = ecdsa.VerifyingKey.from_string(a2b_hex(encrypted_data[0]), select_curve)
-                    else:
-                        log.debug("need to check priority because already get others's pk")
-                        my_pri = sha256(my_pk.to_string() + other_pk.to_string()).digest()
-                        other_pri = sha256(other_pk.to_string() + my_pk.to_string()).digest()
-                        # check 256bit int as big-endian
-                        if my_pri < other_pri:
-                            log.debug("my priority is LOW and over write my shared key by other's")
-                        elif other_pri < my_pri:
-                            log.debug("my priority is HIGH and ignore this command")
-                            continue
-                        else:
-                            raise ConnectionError("my and other's key is same, this means you connect to yourself")
-                    if my_sk is None:
-                        raise ConnectionError("not found my_sk")
-                    shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
-                    self.shared_key = sha256(int(shared_point.x()).to_bytes(32, 'big')).digest()
-                    self.shared_key = self._decrypt(a2b_hex(encrypted_data[1]))
-                    self.sendto(S_ESTABLISHED + self._encrypt(check_msg), address)
-                    log.debug("success decrypt shared key")
-                    break
-
-                elif stage == S_ESTABLISHED:
-                    # 5. check establish by decrypt specific message
-                    decrypt_msg = self._decrypt(data)
-                    if decrypt_msg != check_msg:
-                        raise ConnectionError("failed to check")
-                    log.debug("success hand shaking")
-                    break
-
+                # calculating another port for local debug purposes
+                another_port = conn_addr[1]
+                if another_port % 2:
+                    another_port -= 1  # use 2n+1 if 2n is used
                 else:
-                    raise ConnectionError("not defined message received {}len".format(len(data)))
-        else:
-            # cannot establish
-            raise ConnectionError("timeout on hand shaking")
+                    another_port += 1  # use 2n if 2n+1 is used
+                # another socket is on the same PC and can bind only one
+                
+                # again for debug-purposes (try: first socket, except: second socket)
+                try:
+                    self.receiver_socket.bind(tuple(bind_addr))
+                    conn_addr[1] = another_port
+                except OSError:
+                    # note: this raise OSError if already bind
+                    # unexpected: this raise OSError if CLOSE_WAIT state
+                    bind_addr[1] = another_port
+                    self.receiver_socket.bind(tuple(bind_addr))
+                # Create an optional sender socket for UDP communication
+                self.sender_socket_optional = socket(s.AF_INET, s.SOCK_DGRAM)
+            else:
+                # global
+                bind_addr[0] = ""
+                self.receiver_socket.bind(tuple(bind_addr))
 
-        # get best MUT size
-        # set don't-fragment flag & reset after
-        # avoid Path MTU Discovery Blackhole
-        if self.family == s.AF_INET:
+            self.address = address = tuple(conn_addr)
+            log.debug("try to communicate addr={} bind={}".format(address, bind_addr))
+
+            # warning: allow only 256bit curve
+            select_curve = ecdsa.curves.NIST256p
+            log.debug("select curve {} (static)".format(select_curve))
+            assert select_curve.baselen == 32, ("curve is 256bits size only", select_curve)
+
+            # 1. UDP hole punching
+            punch_msg = b"udp hole punching"
+            self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.name.encode(), address)
+
+            # my secret & public key
+            my_sk = ecdsa.SigningKey.generate(select_curve)
+            my_pk = my_sk.get_verifying_key()
+
+            # other's public key
+            other_pk: Optional[ecdsa.VerifyingKey] = None
+
+            check_msg = b"success hand shake"
+            for _ in range(int(self._timeout / self.span)):
+                r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
+                if r:
+                    data, _addr = self.receiver_socket.recvfrom(1024)
+                    stage, data = data[:1], data[1:]
+
+                    if stage == S_HOLE_PUNCHING:
+                        # 2. send my public key
+                        curve_name = data.replace(punch_msg, b'').decode()
+                        other_curve = find_ecdhe_curve(curve_name)
+                        assert select_curve == other_curve, ("different curve", select_curve, other_curve)
+                        select_curve = find_ecdhe_curve(curve_name)
+                        self.sendto(S_SEND_PUBLIC_KEY + my_pk.to_string(), address)
+                        log.debug("success UDP hole punching")
+
+                    elif stage == S_SEND_PUBLIC_KEY:
+                        # 3. get public key & send shared key
+                        other_pk = ecdsa.VerifyingKey.from_string(data, select_curve)
+                        shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
+                        self.shared_key = sha256(int(shared_point.x()).to_bytes(32, 'big')).digest()
+                        shared_key = os.urandom(32)
+                        encrypted_data = my_pk.to_string().hex() + "+" + self._encrypt(shared_key).hex()
+                        self.shared_key = shared_key
+                        self.sendto(S_SEND_SHARED_KEY + encrypted_data.encode(), address)
+                        log.debug("success getting shared key")
+
+                    elif stage == S_SEND_SHARED_KEY:
+                        # 4. decrypt shared key & send hello msg
+                        encrypted_data = data.decode().split("+")
+                        if other_pk is None:
+                            other_pk = ecdsa.VerifyingKey.from_string(a2b_hex(encrypted_data[0]), select_curve)
+                        else:
+                            log.debug("need to check priority because already get others's pk")
+                            my_pri = sha256(my_pk.to_string() + other_pk.to_string()).digest()
+                            other_pri = sha256(other_pk.to_string() + my_pk.to_string()).digest()
+                            # check 256bit int as big-endian
+                            if my_pri < other_pri:
+                                log.debug("my priority is LOW and over write my shared key by other's")
+                            elif other_pri < my_pri:
+                                log.debug("my priority is HIGH and ignore this command")
+                                continue
+                            else:
+                                raise ConnectionError("my and other's key is same, this means you connect to yourself")
+                        if my_sk is None:
+                            raise ConnectionError("not found my_sk")
+                        shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
+                        self.shared_key = sha256(int(shared_point.x()).to_bytes(32, 'big')).digest()
+                        self.shared_key = self._decrypt(a2b_hex(encrypted_data[1]))
+                        self.sendto(S_ESTABLISHED + self._encrypt(check_msg), address)
+                        log.debug("success decrypt shared key")
+                        break
+
+                    elif stage == S_ESTABLISHED:
+                        # 5. check establish by decrypt specific message
+                        decrypt_msg = self._decrypt(data)
+                        if decrypt_msg != check_msg:
+                            raise ConnectionError("failed to check")
+                        log.debug("successful handshake")
+                        break
+
+                    else:
+                        raise ConnectionError("not defined message received {}len".format(len(data)))
+            else:
+                # cannot establish
+                raise ConnectionError("timeout on handshake")
+
+            # get best MUT size
+            # set don't-fragment flag & reset after
+            # avoid Path MTU Discovery Blackhole
             self.receiver_socket.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
-        self.mtu_size = self._find_mtu_size()
-        if self.family == s.AF_INET:
+            self.mtu_size = self._find_mtu_size()
             self.receiver_socket.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
-        log.debug("success get MUT size %db", self.mtu_size)
+            log.debug("success get MUT size %db", self.mtu_size)
 
-        # success establish connection
-        threading.Thread(target=self._backend, name="SRUDP", daemon=True).start()
-        self.established = True
+            # success establish connection
+            threading.Thread(target=self._backend, name="SRUDP", daemon=True).start()
+            self.established = True
 
-        # auto exit when program closed
-        atexit.register(self.close)
+            # auto exit when program closed
+            atexit.register(self.close)
+            
+        except Exception as e:
+            log.error(f"Connection error: {e}")
+            # Sicherstellen, dass wir die Ressourcen freigeben, wenn etwas schief geht
+            self.close()
+            # Re-raise die Exception, damit der Aufrufer weiß, was passiert ist
+            raise
 
     def _find_mtu_size(self) -> int:
         """confirm by submit real packet"""
@@ -429,7 +480,8 @@ class SecureReliableSocket(socket):
         last_packet: Optional[Packet] = None
         last_receive_time = time()
         last_ack_time = time()
-
+        message_buffer = bytearray()  # Buffer für aktuelle Nachricht
+        
         while not self.is_closed:
             r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
 
@@ -449,18 +501,18 @@ class SecureReliableSocket(socket):
                             transmit_limit -= 1
 
             # send ack as ping (stream may be free)
-            if self.span < time() - last_ack_time:
+            if self.span < (time() - last_ack_time):
                 p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'as ping')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 last_ack_time = time()
 
-            # connection may be broken
+            # connection may be broken - send FIN just to notify that i'm closing
             if self._timeout < time() - last_receive_time:
                 p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 break
 
-            # just socket select timeout (no data received yet)
+            # if no data received, continue
             if len(r) == 0:
                 continue
 
@@ -485,7 +537,7 @@ class SecureReliableSocket(socket):
                 break
 
             # receive ack
-            if packet.control & CONTROL_ACK:
+            if packet.control & CONTROL_ACK: # masking for ACK bit
                 with self.sender_buffer_lock:
                     if 0 < len(self.sender_buffer):
                         for seq in range(self.sender_buffer[0].sequence, packet.sequence + 1):
@@ -500,12 +552,12 @@ class SecureReliableSocket(socket):
 
             # receive reset
             if packet.control & CONTROL_FIN:
-                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'be notified fin or reset')
+                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'been notified fin or reset')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 break
 
             # asked re-transmission
-            if packet.control & CONTROL_RTM:
+            if packet.control & CONTROL_RTM: # masking for RTM bit
                 with self.sender_buffer_lock:
                     for i, p in enumerate(self.sender_buffer):
                         if p.sequence == packet.sequence:
@@ -524,7 +576,8 @@ class SecureReliableSocket(socket):
                 if self.broadcast_hook_fnc is not None:
                     self.broadcast_hook_fnc(packet, self)
                 elif last_packet is None or last_packet.control & CONTROL_EOF:
-                    self._push_receive_buffer(packet.data)
+                    # Broadcast-Nachrichten als eine vollständige Nachricht senden
+                    self._send_complete_message(packet.data)
                 else:
                     # note: acquire realtime response
                     log.debug("throw away %s", packet)
@@ -554,7 +607,14 @@ class SecureReliableSocket(socket):
             # receive data
             if packet.sequence == self.receiver_seq:
                 self.receiver_seq += 1
-                self._push_receive_buffer(packet.data)
+                
+                # Zu Message-Buffer hinzufügen
+                message_buffer.extend(packet.data)
+                
+                # Wenn EOF oder PSH, senden wir die komplette Nachricht über ZeroMQ
+                if packet.control & CONTROL_EOF:
+                    self._send_complete_message(bytes(message_buffer))
+                    message_buffer.clear()
             elif packet.sequence > self.receiver_seq:
                 temporary[packet.sequence] = packet
                 # ask re-transmission if not found before packet
@@ -602,21 +662,31 @@ class SecureReliableSocket(socket):
 
             # update last packet
             last_packet = packet
+            
+            # Save reference to last packet in current thread for EOF detection in _push_receive_buffer
+            threading.current_thread()._last_packet = packet
 
         # close
         log.debug("srudp socket is closing now")
         self.close()
 
-    def _push_receive_buffer(self, data: bytes) -> None:
-        """just append new data to buffer"""
-        if self.fileno() == -1:
-            return  # already closed
+    def _send_complete_message(self, data: bytes) -> None:
+        """Sendet eine vollständige Nachricht an den ZeroMQ-Kanal"""
+        log.debug(f"Sending complete message: {len(data)} bytes")
+        self.receiver_unread_size += len(data)
+        
         try:
-            super().sendall(data)
-            self.receiver_unread_size += len(data)
-        except (OSError, ConnectionError):
-            # Socket might have been closed
-            pass
+            # Prepare the message: size (4 bytes in little-endian) + data
+            size_bytes = len(data).to_bytes(4, 'little')
+            message = size_bytes + data
+            
+            # Send through ZeroMQ
+            self.zmq_push.send(message)
+            log.debug(f"Successfully sent complete message of {len(data)} bytes to ZeroMQ buffer")
+        except OSError as e:
+            log.error(f"OSError writing to ZeroMQ socket: {e}")
+        except Exception as e:
+            log.error(f"Error writing to ZeroMQ socket: {e}")
 
     def _send_buffer_is_full(self) -> bool:
         assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
@@ -679,12 +749,14 @@ class SecureReliableSocket(socket):
         # note: sendto() after bind() with different port cause OSError on recvfrom()
         if self.is_closed:
             return 0
+        # default mode
         elif self.sender_socket_optional is None:
             return self.receiver_socket.sendto(data, address)
+        # local debug mode with 2 local udp sockets
         else:
             return self.sender_socket_optional.sendto(data, address)
 
-    def sendall(self, data: 'ReadableBuffer', flags: int = 0) -> None:
+    def send(self, data: 'ReadableBuffer', flags: int = 0) -> None:
         """high-level method, use this instead of send()"""
         assert flags == 0, "unrecognized flags"
         send_size = 0
@@ -709,25 +781,68 @@ class SecureReliableSocket(socket):
         # window_size = self.get_window_size()
         # if window_size < len(data):
         #    raise ValueError("data is too big {}<{}".format(window_size, len(data)))
-        packet = Packet(CONTROL_BCT, CYC_INT0, 0, time(), data)
+        packet = Packet(CONTROL_BCT | CONTROL_EOF, CYC_INT0, 0, time(), data)
         with self.sender_buffer_lock:
             self.sendto(self._encrypt(packet2bin(packet)), self.address)
 
-    def recv(self, buflen: int = 1024, flags: int = 0) -> bytes:
+    def receive(self, flags: int = 0, timeout: float = 1.0) -> Optional[bytes]:
+        """
+        Wait for and return a complete message.
+        
+        This function waits until a complete message is available or until the 
+        timeout expires. If a complete message is available, it returns the message 
+        bytes. If the timeout expires, it returns None.
+        
+        Args:
+            flags: Must be 0 (reserved for future use)
+            timeout: Maximum time to wait for a complete message in seconds
+            
+        Returns:
+            The complete message as bytes, or None if timeout occurred
+        """
         assert flags == 0, "unrecognized flags"
+        self.sender_time = time()  # update last accessed time
 
-        if self.is_closed:
-            return b""
-        elif not self.established:
-            return b""
-        else:
-            try:
-                data = super().recv(buflen, flags)
-                self.receiver_unread_size -= len(data)
+        if self.is_closed or not self.established:
+            return None
+
+        log.debug(f"receive: starting with timeout={timeout}s")
+
+        try:
+            poller = zmq.Poller()
+            poller.register(self.zmq_pull, zmq.POLLIN)
+
+            # Wait for incoming message with timeout
+            if poller.poll(timeout * 1000):  # timeout in milliseconds
+                message = self.zmq_pull.recv()
+
+                # Extract size and data
+                expected_size = int.from_bytes(message[:4], 'little')
+                data = message[4:]
+
+                log.debug(f"receive: got complete message, size={len(data)}b")
+                
+                # Sanity check
+                if len(data) != expected_size:
+                    log.warning(f"receive: Size prefix ({expected_size}) doesn't match actual data length ({len(data)})")
+                
+                # Empty data?
+                if not data:
+                    return b''
+                    
                 return data
-            except ConnectionError:
-                # self.close() called and buffer closed
-                return b""
+            else:
+                # Timeout occurred
+                log.debug(f"receive: timeout ({timeout}s) with no complete message available")
+                return None
+
+        except zmq.ZMQError as e:
+            log.error(f"ZMQ error in receive: {e}")
+            return None
+        except Exception as e:
+            # Catch potential errors during processing
+            log.error(f"Error processing message in receive: {e}", exc_info=True)
+            return None
 
     def _encrypt(self, data: bytes) -> bytes:
         """encrypt by AES-GCM (more secure than CBC mode)"""
@@ -768,15 +883,60 @@ class SecureReliableSocket(socket):
         return False
 
     def close(self) -> None:
+        # Wenn die Verbindung bereits geschlossen ist, nichts tun
+        if self.is_closed:
+            return
+            
+        # Nur ein FIN-Paket senden, wenn wir schon verbunden waren
         if self.established:
             self.established = False
             p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'closed')
-            self.sendto(self._encrypt(packet2bin(p)), self.address)
-            self.receiver_socket.close()
-            super().close()
+            try:
+                self.sendto(self._encrypt(packet2bin(p)), self.address)
+                # just to give the FIN packet time to be sent and to end everything gracefully
+                sleep(0.01)
+            except:
+                # Fehler beim Senden des FIN-Pakets ignorieren
+                pass
+        
+        # try_connect zurücksetzen
+        self.try_connect = False
+            
+        # ZeroMQ-Sockets sicher schließen
+        try:
+            log.debug(f"Closing ZeroMQ sockets for {self.zmq_endpoint}")
+            if hasattr(self, 'zmq_pull') and self.zmq_pull:
+                self.zmq_pull.close(linger=0)
+            if hasattr(self, 'zmq_push') and self.zmq_push:
+                self.zmq_push.close(linger=0)
+            log.debug(f"ZeroMQ sockets closed for {self.zmq_endpoint}")
+        except Exception as e:
+            log.error(f"Error closing ZeroMQ sockets: {e}")
+        
+        # UDP-Socket schließen
+        try:
+            if hasattr(self, 'receiver_socket') and self.receiver_socket and self.receiver_socket.fileno() != -1:
+                self.receiver_socket.close()
+                log.debug("UDP receiver socket closed")
+        except Exception as e:
+            log.error(f"Error closing UDP receiver socket: {e}")
+        
+        # Optional: Falls vorhanden, das zusätzliche Socket schließen
+        try:
             if self.sender_socket_optional is not None:
                 self.sender_socket_optional.close()
+                log.debug("UDP sender socket closed")
+        except Exception as e:
+            log.error(f"Error closing UDP sender socket: {e}")
+        
+        # Established-Status zurücksetzen
+        self.established = False
+            
+        # Aus dem at-exit Handler entfernen
+        try:
             atexit.unregister(self.close)
+        except Exception:
+            pass
 
 
 def find_ecdhe_curve(curve_name: str) -> ecdsa.curves.Curve:

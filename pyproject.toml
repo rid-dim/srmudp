@@ -9,6 +9,7 @@ readme = "README.md"
 python = "^3.11"
 pycryptodome = "^3.22.0"
 ecdsa = "^0.19.1"
+pyzmq = "^26.4.0"
 
 
 [build-system]
