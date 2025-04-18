@@ -40,13 +40,14 @@ from collections import deque
 from hashlib import sha256
 from binascii import a2b_hex
 from Crypto.Cipher import AES
+from Crypto.PublicKey import ECC
+from Crypto.Hash import SHA256
 from struct import Struct
 from socket import socket
 import socket as s
 import threading
 import logging
 import atexit
-import ecdsa
 import os
 import zmq
 
@@ -333,20 +334,20 @@ class SecureReliableSocket():
             log.debug("try to communicate addr={} bind={}".format(address, bind_addr))
 
             # warning: allow only 256bit curve
-            select_curve = ecdsa.curves.NIST256p
-            log.debug("select curve {} (static)".format(select_curve))
-            assert select_curve.baselen == 32, ("curve is 256bits size only", select_curve)
+            curve_name = 'P-256'
+            log.debug("select curve {} (static)".format(curve_name))
 
             # 1. UDP hole punching
             punch_msg = b"udp hole punching"
-            self.sendto(S_HOLE_PUNCHING + punch_msg + select_curve.name.encode(), address)
+            self.sendto(S_HOLE_PUNCHING + punch_msg + curve_name.encode(), address)
 
             # my secret & public key
-            my_sk = ecdsa.SigningKey.generate(select_curve)
-            my_pk = my_sk.get_verifying_key()
+            my_key = ECC.generate(curve=curve_name)
+            my_pk_pem = my_key.public_key().export_key(format='PEM') # Export as PEM string
+            my_pk_pem_bytes = my_pk_pem.encode('utf-8') # Encode PEM to bytes for sending
 
             # other's public key
-            other_pk: Optional[ecdsa.VerifyingKey] = None
+            other_pk: Optional[ECC.EccKey] = None
 
             check_msg = b"success hand shake"
             for _ in range(int(self._timeout / self.span)):
@@ -357,55 +358,73 @@ class SecureReliableSocket():
 
                     if stage == S_HOLE_PUNCHING:
                         # 2. send my public key
-                        curve_name = data.replace(punch_msg, b'').decode()
-                        other_curve = find_ecdhe_curve(curve_name)
-                        assert select_curve == other_curve, ("different curve", select_curve, other_curve)
-                        select_curve = find_ecdhe_curve(curve_name)
-                        self.sendto(S_SEND_PUBLIC_KEY + my_pk.to_string(), address)
+                        received_curve_name = data.replace(punch_msg, b'').decode()
+                        assert curve_name == received_curve_name, ("different curve", curve_name, received_curve_name)
+                        self.sendto(S_SEND_PUBLIC_KEY + my_pk_pem_bytes, address)
                         log.debug("success UDP hole punching")
 
                     elif stage == S_SEND_PUBLIC_KEY:
                         # 3. get public key & send shared key
-                        other_pk = ecdsa.VerifyingKey.from_string(data, select_curve)
-                        shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
-                        self.shared_key = sha256(int(shared_point.x()).to_bytes(32, 'big')).digest()
-                        shared_key = os.urandom(32)
-                        encrypted_data = my_pk.to_string().hex() + "+" + self._encrypt(shared_key).hex()
-                        self.shared_key = shared_key
-                        self.sendto(S_SEND_SHARED_KEY + encrypted_data.encode(), address)
-                        log.debug("success getting shared key")
+                        other_pk = ECC.import_key(data) # Import directly from PEM bytes
+                        shared_point = other_pk.pointQ * my_key.d # Calculate shared point (scalar multiplication)
+                        coord_len = (shared_point.size_in_bits() + 7) // 8
+                        temp_shared_key = SHA256.new(shared_point.x.to_bytes(coord_len, 'big') + shared_point.y.to_bytes(coord_len, 'big')).digest()
+                        
+                        # Generate a random session key and encrypt it with the derived shared key
+                        session_key = os.urandom(32)
+                        self.shared_key = temp_shared_key
+                        encrypted_session_key = self._encrypt(session_key)
+                        self.shared_key = session_key
+                        
+                        # Send own public key PEM bytes + encrypted session key hex
+                        separator = b'|KEY|'
+                        encrypted_data_payload = my_pk_pem_bytes + separator + encrypted_session_key.hex().encode('utf-8')
+                        self.sendto(S_SEND_SHARED_KEY + encrypted_data_payload, address)
+                        log.debug("success deriving ECDH key and sending encrypted session key")
 
                     elif stage == S_SEND_SHARED_KEY:
-                        # 4. decrypt shared key & send hello msg
-                        encrypted_data = data.decode().split("+")
+                        # 4. decrypt session key & send hello msg
+                        separator = b'|KEY|'
+                        parts = data.split(separator, 1)
+                        if len(parts) != 2:
+                            raise ConnectionError("Invalid S_SEND_SHARED_KEY format")
+                        peer_pk_pem_bytes = parts[0]
+                        encrypted_session_key_hex = parts[1].decode('utf-8')
+
                         if other_pk is None:
-                            other_pk = ecdsa.VerifyingKey.from_string(a2b_hex(encrypted_data[0]), select_curve)
+                            other_pk = ECC.import_key(peer_pk_pem_bytes) # Import directly from PEM bytes
                         else:
                             log.debug("need to check priority because already get others's pk")
-                            my_pri = sha256(my_pk.to_string() + other_pk.to_string()).digest()
-                            other_pri = sha256(other_pk.to_string() + my_pk.to_string()).digest()
-                            # check 256bit int as big-endian
+                            my_pri = sha256(my_pk_pem_bytes + peer_pk_pem_bytes).digest()
+                            other_pri = sha256(peer_pk_pem_bytes + my_pk_pem_bytes).digest()
+
                             if my_pri < other_pri:
-                                log.debug("my priority is LOW and over write my shared key by other's")
+                                log.debug("my priority is LOW and process received session key")
                             elif other_pri < my_pri:
-                                log.debug("my priority is HIGH and ignore this command")
+                                log.debug("my priority is HIGH and ignore this command (use my session key)")
                                 continue
                             else:
                                 raise ConnectionError("my and other's key is same, this means you connect to yourself")
-                        if my_sk is None:
-                            raise ConnectionError("not found my_sk")
-                        shared_point = my_sk.privkey.secret_multiplier * other_pk.pubkey.point
-                        self.shared_key = sha256(int(shared_point.x()).to_bytes(32, 'big')).digest()
-                        self.shared_key = self._decrypt(a2b_hex(encrypted_data[1]))
+                        
+                        if my_key is None:
+                            raise ConnectionError("my_key not generated")
+                        shared_point = other_pk.pointQ * my_key.d
+                        coord_len = (shared_point.size_in_bits() + 7) // 8
+                        derived_key = SHA256.new(shared_point.x.to_bytes(coord_len, 'big') + shared_point.y.to_bytes(coord_len, 'big')).digest()
+
+                        self.shared_key = derived_key
+                        decrypted_session_key = self._decrypt(a2b_hex(encrypted_session_key_hex))
+                        self.shared_key = decrypted_session_key
+
                         self.sendto(S_ESTABLISHED + self._encrypt(check_msg), address)
-                        log.debug("success decrypt shared key")
+                        log.debug("success decrypt session key")
                         break
 
                     elif stage == S_ESTABLISHED:
                         # 5. check establish by decrypt specific message
                         decrypt_msg = self._decrypt(data)
                         if decrypt_msg != check_msg:
-                            raise ConnectionError("failed to check")
+                            raise ConnectionError("failed to check establish message")
                         log.debug("successful handshake")
                         break
 
@@ -937,14 +956,6 @@ class SecureReliableSocket():
             atexit.unregister(self.close)
         except Exception:
             pass
-
-
-def find_ecdhe_curve(curve_name: str) -> ecdsa.curves.Curve:
-    for curve in ecdsa.curves.curves:
-        if curve.name == curve_name:
-            return curve
-    else:
-        raise ConnectionError("unknown curve {}".format(curve_name))
 
 
 def get_mtu_linux(family: int, host: str) -> int:

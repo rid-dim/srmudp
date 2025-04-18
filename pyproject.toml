@@ -8,8 +8,8 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.11"
 pycryptodome = "^3.22.0"
-ecdsa = "^0.19.1"
 pyzmq = "^26.4.0"
+pytest = "^8.3.5"
 
 
 [build-system]
