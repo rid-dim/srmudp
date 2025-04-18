@@ -82,8 +82,12 @@ In other words, it has a connection state, guarantees data to be delivered (if c
 
 Links
 ----
-* [initial implementation of the systematic for 1:1 p2p connection that is adapted here for multi-endpoint connections and serverless peer discovery](https://github.com/namuyan/srudp)
+* [initial implementation of the systematic for 1:1 p2p connection that is adapted here for multi-endpoint connections and serverless peer discovery](https://github.com/namuyan/srmudp)
 
 Licence
 ----
 MIT
+
+## references
+* [udp-hole-punching](https://bford.info/pub/net/p2pnat/)
+* [path mtu discovery](https://github.com/namuyan/srmudp)

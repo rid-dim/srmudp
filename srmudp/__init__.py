@@ -218,7 +218,7 @@ class SecureReliableSocket():
         
         # Create a unique identifier for this socket instance
         socket_id = id(self)
-        self.zmq_endpoint = f"inproc://srudp-internal-{socket_id}"
+        self.zmq_endpoint = f"inproc://srmudp-internal-{socket_id}"
         
         # Create PUSH/PULL sockets instead of PUB/SUB for better message handling
         self.zmq_push = self.zmq_context.socket(zmq.PUSH)
@@ -424,7 +424,7 @@ class SecureReliableSocket():
             log.debug("success get MUT size %db", self.mtu_size)
 
             # success establish connection
-            threading.Thread(target=self._backend, name="SRUDP", daemon=True).start()
+            threading.Thread(target=self._backend, name="SRMUDP", daemon=True).start()
             self.established = True
 
             # auto exit when program closed
@@ -667,7 +667,7 @@ class SecureReliableSocket():
             threading.current_thread()._last_packet = packet
 
         # close
-        log.debug("srudp socket is closing now")
+        log.debug("srmudp socket is closing now")
         self.close()
 
     def _send_complete_message(self, data: bytes) -> None:

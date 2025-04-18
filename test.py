@@ -1,4 +1,4 @@
-from srudp import SecureReliableSocket, Packet
+from srmudp import SecureReliableSocket, Packet
 from concurrent.futures import ThreadPoolExecutor
 from time import sleep
 import socket as s
@@ -9,7 +9,7 @@ import logging
 import os
 
 
-logger = logging.getLogger("srudp")
+logger = logging.getLogger("srmudp")
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter(
     '[%(levelname)-6s] [%(threadName)-10s] [%(asctime)-24s] %(message)s')

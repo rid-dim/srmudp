@@ -1,1 +1,1 @@
-python -m mypy --config-file=mypy.ini srudp
+python -m mypy --config-file=mypy.ini srmudp
