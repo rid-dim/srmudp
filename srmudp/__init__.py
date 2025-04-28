@@ -50,6 +50,8 @@ import logging
 import atexit
 import os
 import zmq
+from .holepunch import HolePuncher
+from .crypto_utils import aes_gcm_encrypt, aes_gcm_decrypt
 
 
 log = logging.getLogger(__name__)
@@ -85,17 +87,6 @@ MAX_RETRANSMIT_LIMIT = 4
 MAX_TEMPORARY_PACKET_SIZE = 50000
 SENDER_SOCKET_WAIT = 0.001  # sec
 
-# Path MTU Discovery
-IP_MTU = 14
-IP_MTU_DISCOVER = 10
-IP_PMTUDISC_DONT = 0
-IP_PMTUDISC_DO = 2
-
-# connection stage
-S_HOLE_PUNCHING = b'\x00'
-S_SEND_PUBLIC_KEY = b'\x01'
-S_SEND_SHARED_KEY = b'\x02'
-S_ESTABLISHED = b'\x03'
 
 # typing
 if TYPE_CHECKING:
@@ -326,173 +317,26 @@ class SecureReliableSocket():
         self.try_connect = True
 
         try:
-            # Formalisierte Adressformatierung
-            conn_addr = get_formal_address_format(address)
-            self.address = address = conn_addr
-            log.debug(f"try to communicate addr={address} local={self.local_address}")
-
-            # warning: allow only 256bit curve
-            curve_name = 'P-256'
-            log.debug("select curve {} (static)".format(curve_name))
-
-            # 1. UDP hole punching
-            punch_msg = b"udp hole punching"
-            self.sendto(S_HOLE_PUNCHING + punch_msg + curve_name.encode(), address)
-
-            # my secret & public key
-            my_key = ECC.generate(curve=curve_name)
-            my_pk_pem = my_key.public_key().export_key(format='PEM') # Export as PEM string
-            my_pk_pem_bytes = my_pk_pem.encode('utf-8') # Encode PEM to bytes for sending
-            
-            # Speichere meinen öffentlichen Schlüssel
-            self.my_public_key = my_pk_pem_bytes
-
-            # other's public key
-            other_pk: Optional[ECC.EccKey] = None
-
-            check_msg = b"success hand shake"
-            for _ in range(int(self._timeout / self.span)):
-                r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
-                if r:
-                    data, _addr = self.receiver_socket.recvfrom(1024)
-                    stage, data = data[:1], data[1:]
-
-                    if stage == S_HOLE_PUNCHING:
-                        # 2. send my public key
-                        received_curve_name = data.replace(punch_msg, b'').decode()
-                        assert curve_name == received_curve_name, ("different curve", curve_name, received_curve_name)
-                        self.sendto(S_SEND_PUBLIC_KEY + my_pk_pem_bytes, address)
-                        log.debug("success UDP hole punching")
-
-                    elif stage == S_SEND_PUBLIC_KEY:
-                        # 3. get public key & send shared key
-                        other_pk = ECC.import_key(data) # Import directly from PEM bytes
-                        # Speichere den öffentlichen Schlüssel des Partners
-                        self.peer_public_key = data
-                        shared_point = other_pk.pointQ * my_key.d # Calculate shared point (scalar multiplication)
-                        coord_len = (shared_point.size_in_bits() + 7) // 8
-                        temp_shared_key = SHA256.new(shared_point.x.to_bytes(coord_len, 'big') + shared_point.y.to_bytes(coord_len, 'big')).digest()
-                        
-                        # Generate a random session key and encrypt it with the derived shared key
-                        session_key = os.urandom(32)
-                        self.shared_key = temp_shared_key
-                        encrypted_session_key = self._encrypt(session_key)
-                        self.shared_key = session_key
-                        
-                        # Send own public key PEM bytes + encrypted session key hex
-                        separator = b'|KEY|'
-                        encrypted_data_payload = my_pk_pem_bytes + separator + encrypted_session_key.hex().encode('utf-8')
-                        self.sendto(S_SEND_SHARED_KEY + encrypted_data_payload, address)
-                        log.debug("success deriving ECDH key and sending encrypted session key")
-
-                    elif stage == S_SEND_SHARED_KEY:
-                        # 4. decrypt session key & send hello msg
-                        separator = b'|KEY|'
-                        parts = data.split(separator, 1)
-                        if len(parts) != 2:
-                            raise ConnectionError("Invalid S_SEND_SHARED_KEY format")
-                        peer_pk_pem_bytes = parts[0]
-                        encrypted_session_key_hex = parts[1].decode('utf-8')
-
-                        if other_pk is None:
-                            other_pk = ECC.import_key(peer_pk_pem_bytes) # Import directly from PEM bytes
-                        else:
-                            log.debug("need to check priority because already get others's pk")
-                            my_pri = sha256(my_pk_pem_bytes + peer_pk_pem_bytes).digest()
-                            other_pri = sha256(peer_pk_pem_bytes + my_pk_pem_bytes).digest()
-
-                            if my_pri < other_pri:
-                                log.debug("my priority is LOW and process received session key")
-                            elif other_pri < my_pri:
-                                log.debug("my priority is HIGH and ignore this command (use my session key)")
-                                continue
-                            else:
-                                raise ConnectionError("my and other's key is same, this means you connect to yourself")
-                        
-                        if my_key is None:
-                            raise ConnectionError("my_key not generated")
-                        shared_point = other_pk.pointQ * my_key.d
-                        coord_len = (shared_point.size_in_bits() + 7) // 8
-                        derived_key = SHA256.new(shared_point.x.to_bytes(coord_len, 'big') + shared_point.y.to_bytes(coord_len, 'big')).digest()
-
-                        self.shared_key = derived_key
-                        decrypted_session_key = self._decrypt(a2b_hex(encrypted_session_key_hex))
-                        self.shared_key = decrypted_session_key
-
-                        self.sendto(S_ESTABLISHED + self._encrypt(check_msg), address)
-                        log.debug("success decrypt session key")
-                        break
-
-                    elif stage == S_ESTABLISHED:
-                        # 5. check establish by decrypt specific message
-                        decrypt_msg = self._decrypt(data)
-                        if decrypt_msg != check_msg:
-                            raise ConnectionError("failed to check establish message")
-                        log.debug("successful handshake")
-                        break
-
-                    else:
-                        raise ConnectionError("not defined message received {}len".format(len(data)))
-            else:
-                # cannot establish
-                raise ConnectionError("timeout on handshake")
-
-            # get best MUT size
-            # set don't-fragment flag & reset after
-            # avoid Path MTU Discovery Blackhole
-            self.receiver_socket.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
-            self.mtu_size = self._find_mtu_size()
-            self.receiver_socket.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DONT)
-            log.debug("success get MUT size %db", self.mtu_size)
-
-            # success establish connection
+            # Verwende HolePuncher für den Verbindungsaufbau
+            holepuncher = HolePuncher(family=self.receiver_socket.family, timeout=self._timeout, span=self.span)
+            shared_key, peer_address, mtu, my_pk, peer_pk = holepuncher.establish_connection(self.receiver_socket, address, logger=log)
+            self.shared_key = shared_key
+            # Log the hashed shared_key for debugging (not the actual key for security reasons)
+            log.debug('Shared key hash: %s', sha256(self.shared_key).hexdigest())
+            self.address = peer_address
+            self.mtu_size = mtu
+            self.my_public_key = my_pk
+            self.peer_public_key = peer_pk
+            log.debug(f"connect success! mtu={self.mtu_size}")
             threading.Thread(target=self._backend, name="SRMUDP", daemon=True).start()
             self.established = True
-
-            # auto exit when program closed
             atexit.register(self.close)
-            
+            # Log connection establishment details
+            log.debug('Connection established with peer: %s, MTU: %d', self.address, self.mtu_size)
         except Exception as e:
             log.error(f"Connection error: {e}")
-            # Sicherstellen, dass wir die Ressourcen freigeben, wenn etwas schief geht
             self.close()
-            # Re-raise die Exception, damit der Aufrufer weiß, was passiert ist
             raise
-
-    def _find_mtu_size(self) -> int:
-        """confirm by submit real packet"""
-        wait = 0.05
-        mut = 1472  # max ipv4:1472b, ipv6:1452b
-        receive_size = 0
-        my_mut_size = None
-        finished_notify = False
-        for _ in range(int(self._timeout / wait)):
-            r, _w, _x = select([self.receiver_socket.fileno()], [], [], wait)
-            if r:
-                data, _addr = self.receiver_socket.recvfrom(1500)
-                if data.startswith(b'#####'):
-                    if len(data) < receive_size:
-                        self.sendto(receive_size.to_bytes(4, 'little'), self.address)
-                        finished_notify = True
-                    else:
-                        receive_size = max(len(data), receive_size)
-                elif len(data) == 4:
-                    my_mut_size = int.from_bytes(data, 'little')
-                else:
-                    pass
-            elif finished_notify and my_mut_size:
-                return my_mut_size
-            elif 1024 < mut:
-                try:
-                    if my_mut_size is None:
-                        self.sendto(b'#' * mut, self.address)
-                except s.error:
-                    pass
-                mut -= 16
-            else:
-                pass
-        else:
-            raise ConnectionError("timeout on finding MUT size")
 
     def _backend(self) -> None:
         """reorder sequence & fill output buffer"""
@@ -561,9 +405,11 @@ class SecureReliableSocket():
                     log.debug(f"Received packet from {addr[0]}:{addr[1]} (expected peer: {self.address[0]}:{self.address[1]})")
 
                 last_receive_time = time()
-                # log.debug("r<< %s", packet)
+                # Log if ACK is received and processed
+                log.debug('Received ACK for sequence %s', packet.sequence)
             except ValueError:
-                # log.debug("decrypt failed len=%s..".format(data[:10]))
+                # Log decryption errors
+                log.debug('Decryption failed for packet data: %s', data[:10])
                 continue
             except (ConnectionResetError, OSError):
                 break
@@ -753,6 +599,9 @@ class SecureReliableSocket():
             # Daten anhängen
             parts.append(data)
             
+            # Log ZeroMQ message sending
+            log.debug('Sending message via ZeroMQ, size: %s bytes', len(data))
+            
             # Senden der Nachricht mit allen Teilen
             self.zmq_push.send_multipart(parts)
             log.debug(f"Successfully sent complete message of {len(data)} bytes from {sender_str} to ZeroMQ buffer")
@@ -933,17 +782,11 @@ class SecureReliableSocket():
 
     def _encrypt(self, data: bytes) -> bytes:
         """encrypt by AES-GCM (more secure than CBC mode)"""
-        cipher: 'GcmMode' = AES.new(self.shared_key, AES.MODE_GCM)
-        # warning: Don't reuse nonce
-        enc, tag = cipher.encrypt_and_digest(data)
-        # output length = 16bytes + 16bytes + N(=data)bytes
-        return bytes(cipher.nonce) + tag + enc
+        return aes_gcm_encrypt(self.shared_key, data)
 
     def _decrypt(self, data: bytes) -> bytes:
         """decrypt by AES-GCM (more secure than CBC mode)"""
-        cipher: 'GcmMode' = AES.new(self.shared_key, AES.MODE_GCM, nonce=data[:16])
-        # ValueError raised when verify failed
-        return cipher.decrypt_and_verify(data[32:], data[16:32])
+        return aes_gcm_decrypt(self.shared_key, data)
 
     def getsockname(self) -> str:
         """self bind info or raise OSError"""
