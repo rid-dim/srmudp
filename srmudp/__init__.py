@@ -33,7 +33,7 @@ note
 * sharedPoint is calculated by multiply secretKey with publicKey.
 * sharedKey is random 256bit bytes, don't use sharedPoint as sharedKey.
 """
-from typing import TYPE_CHECKING, NamedTuple, Optional, Union, Deque, Tuple, Dict, Callable, Any, Sized
+from typing import TYPE_CHECKING, Union, Deque, Tuple, Dict, Callable, Any, Sized, Optional
 from select import select
 from time import sleep, time
 from collections import deque
@@ -52,7 +52,16 @@ import os
 import zmq
 from .holepunch import HolePuncher
 from .crypto_utils import aes_gcm_encrypt, aes_gcm_decrypt
+from .common import (
+    Packet, packet2bin, bin2packet, CYC_INT0, CycInt,
+    CONTROL_ACK, CONTROL_PSH, CONTROL_EOF, CONTROL_BCT, 
+    CONTROL_RTM, CONTROL_FIN, MAX_RETRANSMIT_LIMIT, 
+    MAX_TEMPORARY_PACKET_SIZE, SEND_BUFFER_SIZE,
+    WINDOW_MAX_SIZE, SENDER_SOCKET_WAIT
+)
 
+# Make these available for backend.py
+from .backend import ConnectionBackend
 
 log = logging.getLogger(__name__)
 # Define a struct for packet representation
@@ -63,13 +72,7 @@ log = logging.getLogger(__name__)
 # d  - 8 bytes for timestamp (double)
 packet_struct = Struct("<BIBd")
 
-CONTROL_ACK = 0b00000001  # Acknowledge
-CONTROL_PSH = 0b00000010  # Push data immediately
-CONTROL_EOF = 0b00000100  # end of file
-CONTROL_BCT = 0b00001000  # broadcast
-CONTROL_RTM = 0b00010000  # ask retransmission
-# CONTROL_MTU = 0b00100000  # fix MTU size
-CONTROL_FIN = 0b01000000  # fin
+# Make FLAG_NAMES available for backend.py
 FLAG_NAMES = {
     0b00000000: "---",
     CONTROL_ACK: "ACK",
@@ -78,15 +81,8 @@ FLAG_NAMES = {
     CONTROL_PSH | CONTROL_EOF: "PSH+EOF",
     CONTROL_BCT: "BCT",
     CONTROL_RTM: "RTM",
-    # CONTROL_MTU: "MTU",
     CONTROL_FIN: "FIN",
 }
-WINDOW_MAX_SIZE = 32768  # 32kb
-SEND_BUFFER_SIZE = WINDOW_MAX_SIZE * 8  # 256kb
-MAX_RETRANSMIT_LIMIT = 4
-MAX_TEMPORARY_PACKET_SIZE = 50000
-SENDER_SOCKET_WAIT = 0.001  # sec
-
 
 # typing
 if TYPE_CHECKING:
@@ -96,88 +92,6 @@ if TYPE_CHECKING:
     _Address = Tuple[Any, ...]
     _WildAddress = Union[_Address, str, bytes]
     _BroadcastHook = Callable[['Packet', '_Address', 'SecureReliableSocket'], None]
-
-
-class CycInt(int):
-    """
-    cycle 4bytes unsigned integer
-    loop 0 ~ 0xffffffff
-    """
-    def __add__(self, other: int) -> 'CycInt':
-        return CycInt(super().__add__(other) % 0x100000000)
-
-    def __sub__(self, other: int) -> 'CycInt':
-        return CycInt(super().__sub__(other) % 0x100000000)
-
-    def __hash__(self) -> int:
-        return self % 0x100000000
-
-    def __lt__(self, other: int) -> bool:
-        """self<value"""
-        i = int(self)
-        other = int(other)
-        if i < 0x3fffffff:
-            if other < 0xbfffffff:
-                return i < other
-            else:
-                return False
-        elif i < 0xbfffffff:
-            return i < other
-        else:
-            if other < 0x3fffffff:
-                return True
-            else:
-                return i < other
-
-    def __le__(self, other: int) -> bool:
-        """self<=value"""
-        if self == other:
-            return True
-        return self.__lt__(other)
-
-    def __ge__(self, other: int) -> bool:
-        """self>=value"""
-        return not self.__lt__(other)
-
-    def __gt__(self, other: int) -> bool:
-        """self>value"""
-        return not self.__le__(other)
-
-
-# static cycle int
-CYC_INT0 = CycInt(0)
-
-
-class Packet(NamedTuple):
-    """
-    static 14b
-    [control 1b]-[sequence(ack) 4b]-[retry 1b]-[time 8b]-[data xb]
-    """
-    control: int  # control bit
-    sequence: CycInt  # packet order (cycle 4bytes uint)
-    retry: int  # re-transmission count (disconnected before overflow)
-    time: float  # unix time (double)
-    data: bytes  # data body
-    sender_address: Optional[Tuple[str, int]] = None  # (ip, port) of sender
-
-    def __repr__(self) -> str:
-        addr_str = f", from={self.sender_address[0]}:{self.sender_address[1]}" if self.sender_address else ""
-        return "Packet({} seq:{} retry:{} time:{} data:{}b{})".format(
-            FLAG_NAMES.get(self.control), self.sequence,
-            self.retry, round(self.time, 2), len(self.data), addr_str)
-
-
-def bin2packet(b: bytes, sender_address: Optional[Tuple[str, int]] = None) -> 'Packet':
-    # control, sequence, retry, time
-    c, seq, r, t = packet_struct.unpack_from(b)
-    # Packet(control, sequence, retry, time, data)
-    return Packet(c, CycInt(seq), r, t, b[packet_struct.size:], sender_address)
-
-
-def packet2bin(p: Packet) -> bytes:
-    # log.debug("s>> %s", p)
-    # Packet => binary data
-    return packet_struct.pack(p.control, int(p.sequence), p.retry, p.time) + p.data
 
 
 def get_formal_address_format(address: '_WildAddress', family: int = s.AF_INET) -> '_Address':
@@ -199,7 +113,7 @@ class SecureReliableSocket():
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_time",
         "receiver_seq", "receiver_unread_size", "receiver_socket", "zmq_context", "zmq_push", "zmq_pull", "zmq_endpoint",
         "broadcast_hook_fnc", "loss", "try_connect", "established", "family", "message_buffer", 
-        "my_public_key", "peer_public_key", "port"
+        "my_public_key", "peer_public_key", "port", "backend", "backend_thread"
     ]
 
     def __init__(self, port: int = 0, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
@@ -328,7 +242,25 @@ class SecureReliableSocket():
             self.my_public_key = my_pk
             self.peer_public_key = peer_pk
             log.debug(f"connect success! mtu={self.mtu_size}")
-            threading.Thread(target=self._backend, name="SRMUDP", daemon=True).start()
+            
+            # Create and start backend thread
+            self.backend = ConnectionBackend(
+                socket=self.receiver_socket,
+                zmq_push=self.zmq_push,
+                shared_key=self.shared_key,
+                address=self.address,
+                span=self.span, 
+                timeout=self._timeout,
+                sender_buffer=self.sender_buffer,
+                sender_buffer_lock=self.sender_buffer_lock,
+                sender_signal=self.sender_signal,
+                local_address=self.local_address,
+                broadcast_hook_fnc=self.broadcast_hook_fnc,
+                peer_public_key=self.peer_public_key
+            )
+            self.backend_thread = threading.Thread(target=self.backend.run, name="SRMUDP", daemon=True)
+            self.backend_thread.start()
+            
             self.established = True
             atexit.register(self.close)
             # Log connection establishment details
@@ -338,279 +270,81 @@ class SecureReliableSocket():
             self.close()
             raise
 
-    def _backend(self) -> None:
-        """reorder sequence & fill output buffer"""
-        temporary: 'Dict[CycInt, Packet]' = dict()
-        retransmit_packets: Deque[Packet] = deque()
-        retransmitted: Deque[float] = deque(maxlen=16)
-        last_packet: Optional[Packet] = None
-        last_receive_time = time()
-        last_ack_time = time()
-        message_buffer = bytearray()  # Buffer für aktuelle Nachricht
-        
-        # Debug: Lokale Bind-Adresse
-        if hasattr(self, 'local_address') and self.local_address is not None:
-            log.debug(f"Backend thread started, local socket bound to {self.local_address[0]}:{self.local_address[1]}")
-        else:
-            self.local_address = self.receiver_socket.getsockname()
-            log.debug(f"Backend thread started, local socket bound to {self.local_address[0]}:{self.local_address[1]}")
-        
-        log.debug(f"Peer address is {self.address[0]}:{self.address[1]}")
-        
-        while not self.is_closed:
-            r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
+    @property
+    def is_closed(self) -> bool:
+        if self.receiver_socket.fileno() == -1:
+            self.established = False
+            atexit.unregister(self.close)
+            return True
+        return False
 
-            # re-transmit
-            if 0 < len(self.sender_buffer):
-                with self.sender_buffer_lock:
-                    now = time() - self.span * 2
-                    transmit_limit = MAX_RETRANSMIT_LIMIT  # max transmit at once
-                    for i, p in enumerate(self.sender_buffer):
-                        if transmit_limit == 0:
-                            break
-                        if p.time < now:
-                            self.loss += 1
-                            re_packet = Packet(p.control, p.sequence, p.retry+1, time(), p.data)
-                            self.sender_buffer[i] = re_packet
-                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                            transmit_limit -= 1
-
-            # send ack as ping (stream may be free)
-            if self.span < (time() - last_ack_time):
-                p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'as ping')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
-                last_ack_time = time()
-
-            # connection may be broken - send FIN just to notify that i'm closing
-            if self._timeout < time() - last_receive_time:
-                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
-                break
-
-            # if no data received, continue
-            if len(r) == 0:
-                continue
-
-            """received a packet data"""
-
+    def close(self) -> None:
+        # Wenn die Verbindung bereits geschlossen ist, nichts tun
+        if self.is_closed:
+            return
+            
+        # Nur ein FIN-Paket senden, wenn wir schon verbunden waren
+        if self.established:
+            self.established = False
+            p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'closed')
             try:
-                if self.receiver_seq in temporary:
-                    packet = temporary.pop(self.receiver_seq)
-                else:
-                    # Der eigentliche Empfang des Pakets - hier sehen wir die tatsächliche Absenderadresse!
-                    data, addr = self.receiver_socket.recvfrom(65536)
-                    # Decrypt und erstelle das Packet mit der Absenderadresse, die wir gerade gesehen haben 
-                    packet = bin2packet(self._decrypt(data), addr)
-                    # Debug-Ausgabe für Absenderadresse
-                    log.debug(f"Received packet from {addr[0]}:{addr[1]} (expected peer: {self.address[0]}:{self.address[1]})")
-
-                last_receive_time = time()
-                # Log if ACK is received and processed
-                log.debug('Received ACK for sequence %s', packet.sequence)
-            except ValueError:
-                # Log decryption errors
-                log.debug('Decryption failed for packet data: %s', data[:10])
-                continue
-            except (ConnectionResetError, OSError):
-                break
-            except Exception:
-                log.error("UDP socket closed", exc_info=True)
-                break
-
-            # receive ack
-            if packet.control & CONTROL_ACK: # masking for ACK bit
-                with self.sender_buffer_lock:
-                    if 0 < len(self.sender_buffer):
-                        for seq in range(self.sender_buffer[0].sequence, packet.sequence + 1):
-                            # remove packet that sent and confirmed by ACK
-                            self.sender_buffer.popleft()
-                            if len(self.sender_buffer) == 0:
-                                break
-                        if not self._send_buffer_is_full():
-                            self.sender_signal.set()
-                            log.debug("allow sending operation again seq={}".format(packet.sequence))
-                continue
-
-            # receive reset
-            if packet.control & CONTROL_FIN:
-                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'been notified fin or reset')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
-                break
-
-            # asked re-transmission
-            if packet.control & CONTROL_RTM: # masking for RTM bit
-                with self.sender_buffer_lock:
-                    for i, p in enumerate(self.sender_buffer):
-                        if p.sequence == packet.sequence:
-                            # Füge meinen Public Key zum Paket hinzu, um eine eindeutige Identifikation für die Retransmission zu ermöglichen
-                            re_data = p.data
-                            re_packet = Packet(p.control, p.sequence, p.retry+1, time(), re_data)
-                            self.sender_buffer[i] = re_packet
-                            self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                            retransmitted.append(packet.time)
-                            break  # success
-                    else:
-                        log.error("cannot find packet to retransmit seq={}".format(packet.sequence))
-                        break
-                continue
-
-            # broadcast packet
-            if packet.control & CONTROL_BCT:
-                # Benutze das broadcast_hook_fnc, wenn es konfiguriert ist
-                if self.broadcast_hook_fnc is not None:
-                    self.broadcast_hook_fnc(packet, packet.sender_address or self.address, self)
-                # Ansonsten sende das Paket direkt an die ZeroMQ-Queue
-                elif last_packet is None or last_packet.control & CONTROL_EOF:
-                    # Broadcast-Nachrichten als eine vollständige Nachricht senden
-                    # Füge den Public Key des Peers hinzu, wenn vorhanden
-                    peer_key = None
-                    if hasattr(packet, 'sender_key') and packet.sender_key:
-                        peer_key = packet.sender_key
-                    self._send_complete_message(packet.data, packet.sender_address, peer_key)
-                else:
-                    # note: acquire realtime response
-                    log.debug("throw away %s", packet)
-                continue
-
-            """normal packet from here (except PSH, EOF)"""
-
-            # check the packet is retransmitted
-            if 0 < packet.retry and 0 < len(retransmit_packets):
-                limit = time() - self.span
-                for i, p in enumerate(retransmit_packets):
-                    if p.sequence == packet.sequence:
-                        del retransmit_packets[i]
-                        break  # success retransmitted
-                    if p.sequence < self.receiver_seq:
-                        del retransmit_packets[i]
-                        break  # already received
-                for i, p in enumerate(retransmit_packets):
-                    # too old retransmission request
-                    if p.time < limit:
-                        re_packet = Packet(CONTROL_RTM, p.sequence, p.retry+1, time(), b'')
-                        retransmit_packets[i] = re_packet
-                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                        self.loss += 1
-                        break
-
-            # receive data
-            if packet.sequence == self.receiver_seq:
-                self.receiver_seq += 1
-                
-                # Zu Message-Buffer hinzufügen
-                message_buffer.extend(packet.data)
-                
-                # Wenn EOF oder PSH, senden wir die komplette Nachricht über ZeroMQ
-                if packet.control & CONTROL_EOF:
-                    self._send_complete_message(bytes(message_buffer), packet.sender_address)
-                    message_buffer.clear()
-            elif packet.sequence > self.receiver_seq:
-                temporary[packet.sequence] = packet
-                # ask re-transmission if not found before packet
-                if MAX_TEMPORARY_PACKET_SIZE < len(temporary):
-                    log.error("too many temporary packets stored")
-                    break
-
-                # check self.receiver_seq to packet.sequence for each
-                for lost_seq in map(CycInt, range(packet.sequence - 1, self.receiver_seq - 1, -1)):
-                    if lost_seq in temporary:
-                        continue  # already received packet
-                    for p in retransmit_packets:
-                        if p.sequence == lost_seq:
-                            break  # already pushed request
-                    else:
-                        re_packet = Packet(CONTROL_RTM, lost_seq, 0, time(), b'')
-                        self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
-                        self.loss += 1
-                        retransmit_packets.append(re_packet)
-                        log.debug("ask retransmit seq={}".format(lost_seq))
-
-                # clean temporary
-                if min(temporary.keys()) < self.receiver_seq:
-                    for seq in tuple(temporary.keys()):
-                        if seq < self.receiver_seq:
-                            del temporary[seq]
-
-                log.debug("continue listen socket and reorder packet")
-                continue
-            else:
-                continue  # ignore old packet
-
-            # push buffer immediately
-            if packet.control & CONTROL_PSH:
-                # send ack
-                p = Packet(CONTROL_ACK, self.receiver_seq - 1, 0, time(), b'put buffer')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
-                last_ack_time = time()
-                # log.debug("pushed! buffer %d %s", len(retransmit_packets), retransmit_packets)
-
-            # reached EOF & push broadcast packets
-            if packet.control & CONTROL_EOF:
-                # note: stopped sending broadcast packet after main stream for realtime
-                log.debug("reached end of chunk seq={}".format(packet.sequence))
-
-            # update last packet
-            last_packet = packet
-            
-            # Save reference to last packet in current thread for EOF detection in _push_receive_buffer
-            threading.current_thread()._last_packet = packet
-
-        # close
-        log.debug("srmudp socket is closing now")
-        self.close()
-
-    def _send_complete_message(self, data: bytes, sender_address: '_Address' = None, sender_key: bytes = None) -> None:
-        """Sendet eine vollständige Nachricht an den ZeroMQ-Kanal"""
-        log.debug(f"Sending complete message: {len(data)} bytes")
-        self.receiver_unread_size += len(data)
+                # just to give the FIN packet time to be sent and to end everything gracefully
+                sleep(0.01)
+            except:
+                # Fehler beim Senden des FIN-Pakets ignorieren
+                pass
         
+        # try_connect zurücksetzen
+        self.try_connect = False
+        
+        # Backend schließen, falls es existiert
+        if hasattr(self, 'backend') and self.backend:
+            self.backend.close()
+            
+        # ZeroMQ-Sockets sicher schließen
         try:
-            # Wenn kein Absender angegeben ist, verwende die Peer-Adresse
-            if sender_address is None:
-                sender_address = self.address
-            
-            sender_key = sender_key or self.peer_public_key
-            
-            # Für Debug-Zwecke
-            if sender_address == self.address:
-                log.debug(f"Using peer address as sender: {sender_address}")
-            else:
-                log.debug(f"Using specific sender address: {sender_address}")
-            
-            # Format für den Sender: "IP:Port"
-            # Wichtig: Bei einem Tuple (IP, Port) ist das das Format, das wir brauchen
-            if isinstance(sender_address, tuple) and len(sender_address) >= 2:
-                sender_str = f"{sender_address[0]}:{sender_address[1]}"
-            else:
-                # Fallback, falls wir ein anderes Format bekommen
-                sender_str = str(sender_address)
-            
-            # Prepare the message: sender (string) + public key + data as multipart message
-            # Send through ZeroMQ
-            parts = [sender_str.encode('utf-8')]
-            
-            # Wenn wir einen Public Key haben, fügen wir ihn hinzu
-            if sender_key is not None:
-                parts.append(sender_key)
-            else:
-                # Leerer Platzhalter für konsistente Nachrichtenformate
-                parts.append(b'')
-            
-            # Daten anhängen
-            parts.append(data)
-            
-            # Log ZeroMQ message sending
-            log.debug('Sending message via ZeroMQ, size: %s bytes', len(data))
-            
-            # Senden der Nachricht mit allen Teilen
-            self.zmq_push.send_multipart(parts)
-            log.debug(f"Successfully sent complete message of {len(data)} bytes from {sender_str} to ZeroMQ buffer")
-        except OSError as e:
-            log.error(f"OSError writing to ZeroMQ socket: {e}")
+            log.debug(f"Closing ZeroMQ sockets for {self.zmq_endpoint}")
+            if hasattr(self, 'zmq_pull') and self.zmq_pull:
+                self.zmq_pull.close(linger=0)
+            if hasattr(self, 'zmq_push') and self.zmq_push:
+                self.zmq_push.close(linger=0)
+            log.debug(f"ZeroMQ sockets closed for {self.zmq_endpoint}")
         except Exception as e:
-            log.error(f"Error writing to ZeroMQ socket: {e}")
+            log.error(f"Error closing ZeroMQ sockets: {e}")
+        
+        # UDP-Socket schließen
+        try:
+            if hasattr(self, 'receiver_socket') and self.receiver_socket and self.receiver_socket.fileno() != -1:
+                self.receiver_socket.close()
+                log.debug("UDP receiver socket closed")
+        except Exception as e:
+            log.error(f"Error closing UDP receiver socket: {e}")
+        
+        # Established-Status zurücksetzen
+        self.established = False
+            
+        # Aus dem at-exit Handler entfernen
+        try:
+            atexit.unregister(self.close)
+        except Exception:
+            pass
+
+    def broadcast(self, data: bytes) -> None:
+        """broadcast data (do not check reach)"""
+        if not self.established:
+            raise ConnectionAbortedError('disconnected')
+        # do not check size
+        # window_size = self.get_window_size()
+        # if window_size < len(data):
+        #    raise ValueError("data is too big {}<{}".format(window_size, len(data)))
+        # Keine Absenderadresse setzen - der Empfänger bestimmt diese
+        packet = Packet(CONTROL_BCT | CONTROL_EOF, CYC_INT0, 0, time(), data)
+        with self.sender_buffer_lock:
+            self.sendto(self._encrypt(packet2bin(packet)), self.address)
 
     def _send_buffer_is_full(self) -> bool:
+        """Check if the send buffer is full."""
         assert self.sender_buffer_lock.locked(), 'unlocked send_buffer!'
         return SEND_BUFFER_SIZE < sum(len(p.data) for p in self.sender_buffer)
 
@@ -675,7 +409,7 @@ class SecureReliableSocket():
         # Verwende immer das gleiche Socket zum Senden
         return self.receiver_socket.sendto(data, address)
 
-    def send(self, data: 'ReadableBuffer', flags: int = 0) -> None:
+    def sendall(self, data: 'ReadableBuffer', flags: int = 0) -> None:
         """high-level method, use this instead of send()"""
         assert flags == 0, "unrecognized flags"
         send_size = 0
@@ -691,19 +425,6 @@ class SecureReliableSocket():
             else:
                 log.debug("waiting for sending buffer have space..")
         log.debug("send operation success %sb", send_size)
-
-    def broadcast(self, data: bytes) -> None:
-        """broadcast data (do not check reach)"""
-        if not self.established:
-            raise ConnectionAbortedError('disconnected')
-        # do not check size
-        # window_size = self.get_window_size()
-        # if window_size < len(data):
-        #    raise ValueError("data is too big {}<{}".format(window_size, len(data)))
-        # Keine Absenderadresse setzen - der Empfänger bestimmt diese
-        packet = Packet(CONTROL_BCT | CONTROL_EOF, CYC_INT0, 0, time(), data)
-        with self.sender_buffer_lock:
-            self.sendto(self._encrypt(packet2bin(packet)), self.address)
 
     def receive(self, flags: int = 0, timeout: float = 1.0) -> Optional[Tuple[str, bytes, Optional[bytes]]]:
         """
@@ -766,6 +487,10 @@ class SecureReliableSocket():
                 if not data:
                     return sender, b'', sender_key
                     
+                # Update loss value from backend
+                if hasattr(self, 'backend') and self.backend:
+                    self.loss = self.backend.loss
+                    
                 return sender, data, sender_key
             else:
                 # Timeout occurred
@@ -804,72 +529,6 @@ class SecureReliableSocket():
             raise OSError("not found peer connection")
         else:
             return f"{self.address[0]}:{self.address[1]}"
-
-    @property
-    def is_closed(self) -> bool:
-        if self.receiver_socket.fileno() == -1:
-            self.established = False
-            atexit.unregister(self.close)
-            return True
-        return False
-
-    def close(self) -> None:
-        # Wenn die Verbindung bereits geschlossen ist, nichts tun
-        if self.is_closed:
-            return
-            
-        # Nur ein FIN-Paket senden, wenn wir schon verbunden waren
-        if self.established:
-            self.established = False
-            p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'closed')
-            try:
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
-                # just to give the FIN packet time to be sent and to end everything gracefully
-                sleep(0.01)
-            except:
-                # Fehler beim Senden des FIN-Pakets ignorieren
-                pass
-        
-        # try_connect zurücksetzen
-        self.try_connect = False
-            
-        # ZeroMQ-Sockets sicher schließen
-        try:
-            log.debug(f"Closing ZeroMQ sockets for {self.zmq_endpoint}")
-            if hasattr(self, 'zmq_pull') and self.zmq_pull:
-                self.zmq_pull.close(linger=0)
-            if hasattr(self, 'zmq_push') and self.zmq_push:
-                self.zmq_push.close(linger=0)
-            log.debug(f"ZeroMQ sockets closed for {self.zmq_endpoint}")
-        except Exception as e:
-            log.error(f"Error closing ZeroMQ sockets: {e}")
-        
-        # UDP-Socket schließen
-        try:
-            if hasattr(self, 'receiver_socket') and self.receiver_socket and self.receiver_socket.fileno() != -1:
-                self.receiver_socket.close()
-                log.debug("UDP receiver socket closed")
-        except Exception as e:
-            log.error(f"Error closing UDP receiver socket: {e}")
-        
-        # Established-Status zurücksetzen
-        self.established = False
-            
-        # Aus dem at-exit Handler entfernen
-        try:
-            atexit.unregister(self.close)
-        except Exception:
-            pass
-
-
-def get_mtu_linux(family: int, host: str) -> int:
-    """MTU on Linux"""
-    with socket(family, s.SOCK_DGRAM) as sock:
-        sock.connect((host, 0))
-        if family == s.AF_INET:
-            # set option DF (only for ipv4)
-            sock.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
-        return sock.getsockopt(s.IPPROTO_IP, IP_MTU)
 
 
 def main() -> None:
