@@ -104,7 +104,7 @@ if TYPE_CHECKING:
     from typing import Sized
     _Address = Tuple[Any, ...]
     _WildAddress = Union[_Address, str, bytes]
-    _BroadcastHook = Callable[['Packet', 'SecureReliableSocket'], None]
+    _BroadcastHook = Callable[['Packet', '_Address', 'SecureReliableSocket'], None]
 
 
 class CycInt(int):
@@ -167,18 +167,20 @@ class Packet(NamedTuple):
     retry: int  # re-transmission count (disconnected before overflow)
     time: float  # unix time (double)
     data: bytes  # data body
+    sender_address: Optional[Tuple[str, int]] = None  # (ip, port) of sender
 
     def __repr__(self) -> str:
-        return "Packet({} seq:{} retry:{} time:{} data:{}b)".format(
+        addr_str = f", from={self.sender_address[0]}:{self.sender_address[1]}" if self.sender_address else ""
+        return "Packet({} seq:{} retry:{} time:{} data:{}b{})".format(
             FLAG_NAMES.get(self.control), self.sequence,
-            self.retry, round(self.time, 2), len(self.data))
+            self.retry, round(self.time, 2), len(self.data), addr_str)
 
 
-def bin2packet(b: bytes) -> 'Packet':
+def bin2packet(b: bytes, sender_address: Optional[Tuple[str, int]] = None) -> 'Packet':
     # control, sequence, retry, time
     c, seq, r, t = packet_struct.unpack_from(b)
     # Packet(control, sequence, retry, time, data)
-    return Packet(c, CycInt(seq), r, t, b[packet_struct.size:])
+    return Packet(c, CycInt(seq), r, t, b[packet_struct.size:], sender_address)
 
 
 def packet2bin(p: Packet) -> bytes:
@@ -202,14 +204,16 @@ def get_formal_address_format(address: '_WildAddress', family: int = s.AF_INET) 
 
 class SecureReliableSocket():
     __slots__ = [
-        "_timeout", "span", "address", "shared_key", "mtu_size",
-        "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_socket_optional", "sender_time",
+        "_timeout", "span", "address", "local_address", "shared_key", "mtu_size",
+        "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_time",
         "receiver_seq", "receiver_unread_size", "receiver_socket", "zmq_context", "zmq_push", "zmq_pull", "zmq_endpoint",
-        "broadcast_hook_fnc", "loss", "try_connect", "established", "family", "message_buffer"
+        "broadcast_hook_fnc", "loss", "try_connect", "established", "family", "message_buffer", 
+        "my_public_key", "peer_public_key", "port"
     ]
 
-    def __init__(self, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
+    def __init__(self, port: int = 0, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
         """
+        :param port: Port to bind the socket to (0 = automatic port selection)
         :param family: socket type AF_INET or AF_INET6
         :param timeout: auto socket close by the time passed (sec)
         :param span: check socket status by the span (sec)
@@ -251,21 +255,32 @@ class SecureReliableSocket():
         self._timeout = timeout
         self.span = span
         self.address: '_Address' = None
+        self.local_address: '_Address' = None  # Lokale Bind-Adresse des Sockets
         self.shared_key: bytes = None
         self.mtu_size = 0  # 1472b
         self.sender_time = 0.0
+        
+        # Öffentliche Schlüssel für die Identifikation
+        self.my_public_key: Optional[bytes] = None
+        self.peer_public_key: Optional[bytes] = None
 
         # sender params
         self.sender_seq = CycInt(1)  # next send sequence
         self.sender_buffer: Deque[Packet] = deque() # deque is a double-ended queue that allows appending and popping from both ends efficiently.
         self.sender_signal = threading.Event()  # clear when buffer is empty
         self.sender_buffer_lock = threading.Lock()
-        self.sender_socket_optional: Optional[socket] = None
 
         # receiver params
         self.receiver_seq = CycInt(1)  # next receive sequence
         self.receiver_unread_size = 0
         self.receiver_socket = socket(family, s.SOCK_DGRAM)
+        
+        # Binde den Socket an den angegebenen Port
+        self.port = port
+        self.receiver_socket.bind(("", port))
+        self.local_address = self.receiver_socket.getsockname()
+        log.debug(f"Socket bound to port {self.port} (actual: {self.local_address[1]})")
+        
         # Buffer für die Zusammenstellung kompletter Nachrichten
         self.message_buffer = bytearray()
 
@@ -288,50 +303,33 @@ class SecureReliableSocket():
         else:
             status = "UNKNOWN"
         return "<SecureReliableSocket %s %s send=%s recv=%s loss=%s>"\
-               % (status, self.address, self.sender_seq, self.receiver_seq, self.loss)
+               % (status, self.get_socket_name(), self.sender_seq, self.receiver_seq, self.loss)
 
-    def connect(self, address: '_WildAddress') -> None:
+    def get_socket_name(self) -> str:
+        """Return socket name in format 'IP:Port'"""
+        if self.address is None:
+            return "Not connected"
+        return f"{self.address[0]}:{self.address[1]}"
+
+    def connect(self, address: Union['_WildAddress', str]) -> None:
         """throw hole-punch msg, listen port and exchange keys"""
         assert not self.established, "already established"
         assert not self.is_closed, "already closed socket"
         assert not self.try_connect, "already try to connect"
 
+        # Unterstützung für "IP:Port" Notation als String
+        if isinstance(address, str) and ":" in address:
+            host, port_str = address.rsplit(":", 1)
+            address = (host, int(port_str))
+
         # start communication (only once you can try)
         self.try_connect = True
 
         try:
-            # bind socket address
-            conn_addr = list(get_formal_address_format(address))
-            bind_addr = conn_addr.copy()
-
-            if conn_addr[0] in ("127.0.0.1", "::1"):
-
-                # calculating another port for local debug purposes
-                another_port = conn_addr[1]
-                if another_port % 2:
-                    another_port -= 1  # use 2n+1 if 2n is used
-                else:
-                    another_port += 1  # use 2n if 2n+1 is used
-                # another socket is on the same PC and can bind only one
-                
-                # again for debug-purposes (try: first socket, except: second socket)
-                try:
-                    self.receiver_socket.bind(tuple(bind_addr))
-                    conn_addr[1] = another_port
-                except OSError:
-                    # note: this raise OSError if already bind
-                    # unexpected: this raise OSError if CLOSE_WAIT state
-                    bind_addr[1] = another_port
-                    self.receiver_socket.bind(tuple(bind_addr))
-                # Create an optional sender socket for UDP communication
-                self.sender_socket_optional = socket(s.AF_INET, s.SOCK_DGRAM)
-            else:
-                # global
-                bind_addr[0] = ""
-                self.receiver_socket.bind(tuple(bind_addr))
-
-            self.address = address = tuple(conn_addr)
-            log.debug("try to communicate addr={} bind={}".format(address, bind_addr))
+            # Formalisierte Adressformatierung
+            conn_addr = get_formal_address_format(address)
+            self.address = address = conn_addr
+            log.debug(f"try to communicate addr={address} local={self.local_address}")
 
             # warning: allow only 256bit curve
             curve_name = 'P-256'
@@ -345,6 +343,9 @@ class SecureReliableSocket():
             my_key = ECC.generate(curve=curve_name)
             my_pk_pem = my_key.public_key().export_key(format='PEM') # Export as PEM string
             my_pk_pem_bytes = my_pk_pem.encode('utf-8') # Encode PEM to bytes for sending
+            
+            # Speichere meinen öffentlichen Schlüssel
+            self.my_public_key = my_pk_pem_bytes
 
             # other's public key
             other_pk: Optional[ECC.EccKey] = None
@@ -366,6 +367,8 @@ class SecureReliableSocket():
                     elif stage == S_SEND_PUBLIC_KEY:
                         # 3. get public key & send shared key
                         other_pk = ECC.import_key(data) # Import directly from PEM bytes
+                        # Speichere den öffentlichen Schlüssel des Partners
+                        self.peer_public_key = data
                         shared_point = other_pk.pointQ * my_key.d # Calculate shared point (scalar multiplication)
                         coord_len = (shared_point.size_in_bits() + 7) // 8
                         temp_shared_key = SHA256.new(shared_point.x.to_bytes(coord_len, 'big') + shared_point.y.to_bytes(coord_len, 'big')).digest()
@@ -501,6 +504,15 @@ class SecureReliableSocket():
         last_ack_time = time()
         message_buffer = bytearray()  # Buffer für aktuelle Nachricht
         
+        # Debug: Lokale Bind-Adresse
+        if hasattr(self, 'local_address') and self.local_address is not None:
+            log.debug(f"Backend thread started, local socket bound to {self.local_address[0]}:{self.local_address[1]}")
+        else:
+            self.local_address = self.receiver_socket.getsockname()
+            log.debug(f"Backend thread started, local socket bound to {self.local_address[0]}:{self.local_address[1]}")
+        
+        log.debug(f"Peer address is {self.address[0]}:{self.address[1]}")
+        
         while not self.is_closed:
             r, _w, _x = select([self.receiver_socket.fileno()], [], [], self.span)
 
@@ -541,8 +553,12 @@ class SecureReliableSocket():
                 if self.receiver_seq in temporary:
                     packet = temporary.pop(self.receiver_seq)
                 else:
-                    data, _addr = self.receiver_socket.recvfrom(65536)
-                    packet = bin2packet(self._decrypt(data))
+                    # Der eigentliche Empfang des Pakets - hier sehen wir die tatsächliche Absenderadresse!
+                    data, addr = self.receiver_socket.recvfrom(65536)
+                    # Decrypt und erstelle das Packet mit der Absenderadresse, die wir gerade gesehen haben 
+                    packet = bin2packet(self._decrypt(data), addr)
+                    # Debug-Ausgabe für Absenderadresse
+                    log.debug(f"Received packet from {addr[0]}:{addr[1]} (expected peer: {self.address[0]}:{self.address[1]})")
 
                 last_receive_time = time()
                 # log.debug("r<< %s", packet)
@@ -580,7 +596,9 @@ class SecureReliableSocket():
                 with self.sender_buffer_lock:
                     for i, p in enumerate(self.sender_buffer):
                         if p.sequence == packet.sequence:
-                            re_packet = Packet(p.control, p.sequence, p.retry+1, time(), p.data)
+                            # Füge meinen Public Key zum Paket hinzu, um eine eindeutige Identifikation für die Retransmission zu ermöglichen
+                            re_data = p.data
+                            re_packet = Packet(p.control, p.sequence, p.retry+1, time(), re_data)
                             self.sender_buffer[i] = re_packet
                             self.sendto(self._encrypt(packet2bin(re_packet)), self.address)
                             retransmitted.append(packet.time)
@@ -592,11 +610,17 @@ class SecureReliableSocket():
 
             # broadcast packet
             if packet.control & CONTROL_BCT:
+                # Benutze das broadcast_hook_fnc, wenn es konfiguriert ist
                 if self.broadcast_hook_fnc is not None:
-                    self.broadcast_hook_fnc(packet, self)
+                    self.broadcast_hook_fnc(packet, packet.sender_address or self.address, self)
+                # Ansonsten sende das Paket direkt an die ZeroMQ-Queue
                 elif last_packet is None or last_packet.control & CONTROL_EOF:
                     # Broadcast-Nachrichten als eine vollständige Nachricht senden
-                    self._send_complete_message(packet.data)
+                    # Füge den Public Key des Peers hinzu, wenn vorhanden
+                    peer_key = None
+                    if hasattr(packet, 'sender_key') and packet.sender_key:
+                        peer_key = packet.sender_key
+                    self._send_complete_message(packet.data, packet.sender_address, peer_key)
                 else:
                     # note: acquire realtime response
                     log.debug("throw away %s", packet)
@@ -632,7 +656,7 @@ class SecureReliableSocket():
                 
                 # Wenn EOF oder PSH, senden wir die komplette Nachricht über ZeroMQ
                 if packet.control & CONTROL_EOF:
-                    self._send_complete_message(bytes(message_buffer))
+                    self._send_complete_message(bytes(message_buffer), packet.sender_address)
                     message_buffer.clear()
             elif packet.sequence > self.receiver_seq:
                 temporary[packet.sequence] = packet
@@ -689,19 +713,49 @@ class SecureReliableSocket():
         log.debug("srmudp socket is closing now")
         self.close()
 
-    def _send_complete_message(self, data: bytes) -> None:
+    def _send_complete_message(self, data: bytes, sender_address: '_Address' = None, sender_key: bytes = None) -> None:
         """Sendet eine vollständige Nachricht an den ZeroMQ-Kanal"""
         log.debug(f"Sending complete message: {len(data)} bytes")
         self.receiver_unread_size += len(data)
         
         try:
-            # Prepare the message: size (4 bytes in little-endian) + data
-            size_bytes = len(data).to_bytes(4, 'little')
-            message = size_bytes + data
+            # Wenn kein Absender angegeben ist, verwende die Peer-Adresse
+            if sender_address is None:
+                sender_address = self.address
             
+            sender_key = sender_key or self.peer_public_key
+            
+            # Für Debug-Zwecke
+            if sender_address == self.address:
+                log.debug(f"Using peer address as sender: {sender_address}")
+            else:
+                log.debug(f"Using specific sender address: {sender_address}")
+            
+            # Format für den Sender: "IP:Port"
+            # Wichtig: Bei einem Tuple (IP, Port) ist das das Format, das wir brauchen
+            if isinstance(sender_address, tuple) and len(sender_address) >= 2:
+                sender_str = f"{sender_address[0]}:{sender_address[1]}"
+            else:
+                # Fallback, falls wir ein anderes Format bekommen
+                sender_str = str(sender_address)
+            
+            # Prepare the message: sender (string) + public key + data as multipart message
             # Send through ZeroMQ
-            self.zmq_push.send(message)
-            log.debug(f"Successfully sent complete message of {len(data)} bytes to ZeroMQ buffer")
+            parts = [sender_str.encode('utf-8')]
+            
+            # Wenn wir einen Public Key haben, fügen wir ihn hinzu
+            if sender_key is not None:
+                parts.append(sender_key)
+            else:
+                # Leerer Platzhalter für konsistente Nachrichtenformate
+                parts.append(b'')
+            
+            # Daten anhängen
+            parts.append(data)
+            
+            # Senden der Nachricht mit allen Teilen
+            self.zmq_push.send_multipart(parts)
+            log.debug(f"Successfully sent complete message of {len(data)} bytes from {sender_str} to ZeroMQ buffer")
         except OSError as e:
             log.error(f"OSError writing to ZeroMQ socket: {e}")
         except Exception as e:
@@ -749,6 +803,8 @@ class SecureReliableSocket():
             # send one packet
             throw = data[window_size * i:window_size * (i + 1)]
             with self.sender_buffer_lock:
+                # Bei der Packet-Erstellung verwenden wir KEINE Absenderadresse
+                # Der Empfänger setzt diese beim Empfang basierend auf seiner Sicht
                 packet = Packet(control, self.sender_seq, 0, time(), throw.tobytes())
                 self.sender_buffer.append(packet)
                 self.sendto(self._encrypt(packet2bin(packet)), self.address)
@@ -765,15 +821,10 @@ class SecureReliableSocket():
 
     def sendto(self, data: 'ReadableBuffer', address: '_Address') -> int:  # type: ignore
         """row-level method: guarded by `sender_buffer_lock`, don't use.."""
-        # note: sendto() after bind() with different port cause OSError on recvfrom()
         if self.is_closed:
             return 0
-        # default mode
-        elif self.sender_socket_optional is None:
-            return self.receiver_socket.sendto(data, address)
-        # local debug mode with 2 local udp sockets
-        else:
-            return self.sender_socket_optional.sendto(data, address)
+        # Verwende immer das gleiche Socket zum Senden
+        return self.receiver_socket.sendto(data, address)
 
     def send(self, data: 'ReadableBuffer', flags: int = 0) -> None:
         """high-level method, use this instead of send()"""
@@ -800,24 +851,27 @@ class SecureReliableSocket():
         # window_size = self.get_window_size()
         # if window_size < len(data):
         #    raise ValueError("data is too big {}<{}".format(window_size, len(data)))
+        # Keine Absenderadresse setzen - der Empfänger bestimmt diese
         packet = Packet(CONTROL_BCT | CONTROL_EOF, CYC_INT0, 0, time(), data)
         with self.sender_buffer_lock:
             self.sendto(self._encrypt(packet2bin(packet)), self.address)
 
-    def receive(self, flags: int = 0, timeout: float = 1.0) -> Optional[bytes]:
+    def receive(self, flags: int = 0, timeout: float = 1.0) -> Optional[Tuple[str, bytes, Optional[bytes]]]:
         """
-        Wait for and return a complete message.
+        Wait for and return a complete message with sender information.
         
         This function waits until a complete message is available or until the 
-        timeout expires. If a complete message is available, it returns the message 
-        bytes. If the timeout expires, it returns None.
+        timeout expires. If a complete message is available, it returns a tuple with
+        the sender address ("IP:Port"), message bytes, and optionally the sender's public key. 
+        If the timeout expires, it returns None.
         
         Args:
             flags: Must be 0 (reserved for future use)
             timeout: Maximum time to wait for a complete message in seconds
             
         Returns:
-            The complete message as bytes, or None if timeout occurred
+            A tuple (sender, message, public_key) where sender is a string in the format "IP:Port",
+            message is bytes, and public_key is the sender's public key or None. Returns None if timeout occurred.
         """
         assert flags == 0, "unrecognized flags"
         self.sender_time = time()  # update last accessed time
@@ -833,23 +887,37 @@ class SecureReliableSocket():
 
             # Wait for incoming message with timeout
             if poller.poll(timeout * 1000):  # timeout in milliseconds
-                message = self.zmq_pull.recv()
-
-                # Extract size and data
-                expected_size = int.from_bytes(message[:4], 'little')
-                data = message[4:]
-
-                log.debug(f"receive: got complete message, size={len(data)}b")
+                # Receive multipart message [sender_addr, sender_key, data]
+                parts = self.zmq_pull.recv_multipart()
                 
-                # Sanity check
-                if len(data) != expected_size:
-                    log.warning(f"receive: Size prefix ({expected_size}) doesn't match actual data length ({len(data)})")
+                if len(parts) < 2:
+                    log.warning(f"receive: Got {len(parts)} message parts instead of expected 3")
+                    return None
+                    
+                sender_bytes = parts[0]
+                sender = sender_bytes.decode('utf-8')
+                
+                # Wenn wir drei Teile haben, ist der zweite Teil der Public Key
+                sender_key = None
+                if len(parts) >= 3:
+                    sender_key_bytes = parts[1]
+                    # Wenn der Key nicht leer ist, verwende ihn
+                    if sender_key_bytes:
+                        sender_key = sender_key_bytes
+                    data = parts[2]
+                else:
+                    # Älteres Format ohne Key
+                    data = parts[1]
+                
+                # Debug: Wer war der Absender
+                log.debug(f"receive: got complete message from {sender}, size={len(data)}b")
+                log.debug(f"My local socket is bound to {self.receiver_socket.getsockname()}")
                 
                 # Empty data?
                 if not data:
-                    return b''
+                    return sender, b'', sender_key
                     
-                return data
+                return sender, data, sender_key
             else:
                 # Timeout occurred
                 log.debug(f"receive: timeout ({timeout}s) with no complete message available")
@@ -877,21 +945,22 @@ class SecureReliableSocket():
         # ValueError raised when verify failed
         return cipher.decrypt_and_verify(data[32:], data[16:32])
 
-    def getsockname(self) -> '_Address':
+    def getsockname(self) -> str:
         """self bind info or raise OSError"""
         if self.is_closed:
             raise OSError("socket is closed")
         else:
-            return self.receiver_socket.getsockname()  # type: ignore
+            sock_addr = self.receiver_socket.getsockname()
+            return f"{sock_addr[0]}:{sock_addr[1]}"
 
-    def getpeername(self) -> '_Address':
+    def getpeername(self) -> str:
         """connection info or raise OSError"""
         if self.is_closed:
             raise OSError("socket is closed")
         elif self.address is None:
             raise OSError("not found peer connection")
         else:
-            return self.address
+            return f"{self.address[0]}:{self.address[1]}"
 
     @property
     def is_closed(self) -> bool:
@@ -940,14 +1009,6 @@ class SecureReliableSocket():
         except Exception as e:
             log.error(f"Error closing UDP receiver socket: {e}")
         
-        # Optional: Falls vorhanden, das zusätzliche Socket schließen
-        try:
-            if self.sender_socket_optional is not None:
-                self.sender_socket_optional.close()
-                log.debug("UDP sender socket closed")
-        except Exception as e:
-            log.error(f"Error closing UDP sender socket: {e}")
-        
         # Established-Status zurücksetzen
         self.established = False
             
@@ -986,36 +1047,41 @@ def main() -> None:
     sh.setFormatter(formatter)
     logger.addHandler(sh)
 
-    sock = SecureReliableSocket()
+    sock = SecureReliableSocket(port)
     sock.connect((remote_host, port))
     log.debug("connect success! mtu=%d", sock.mtu_size)
 
     def listen() -> None:
         size, start = 0, time()
         while True:
-            r = sock.recv(8192)
-            if len(r) == 0:
+            r = sock.receive(timeout=1.0)
+            if r is None:
+                continue
+            sender, data, key = r
+            if len(data) == 0:
                 break
-            if 0 <= r.find(b'start!'):
+            if 0 <= data.find(b'start!'):
                 size, start = 0, time()
-            size += len(r)
-            if 0 <= r.find(b'success!'):
+            size += len(data)
+            if 0 <= data.find(b'success!'):
                 span = max(0.000001, time()-start)
-                log.debug("received! %db loss=%d %skb/s\n", size, sock.loss, round(size/span/1000, 2))
+                log.debug("received! %db from %s, loss=%d %skb/s\n", 
+                         size, sender, sock.loss, round(size/span/1000, 2))
             # log.debug("recv %d %d", size, len(r))
         log.debug("closed receive")
 
     def sending() -> None:
         while msglen:
-            sock.sendall(b'start!'+os.urandom(msglen)+b'success!')  # +14
+            sock.send(b'start!'+os.urandom(msglen)+b'success!')  # +14
             log.debug("send now! loss=%d time=%d", sock.loss, int(time()))
             if 0 == random.randint(0, 5):
                 sock.broadcast(b'find me! ' + str(time()).encode())
                 log.debug("send broadcast!")
             sleep(20)
 
-    def broadcast_hook(packet: Packet, _sock: SecureReliableSocket) -> None:
-        log.debug("find you!!! (%s)", packet)
+    def broadcast_hook(packet: Packet, sender_address: '_Address', _sock: SecureReliableSocket) -> None:
+        sender_str = f"{sender_address[0]}:{sender_address[1]}"
+        log.debug("find you!!! from %s (%s)", sender_str, packet)
 
     sock.broadcast_hook_fnc = broadcast_hook
     threading.Thread(target=listen).start()
