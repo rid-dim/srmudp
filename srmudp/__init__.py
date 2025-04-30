@@ -54,7 +54,7 @@ from .holepunch import HolePuncher
 from .crypto_utils import aes_gcm_encrypt, aes_gcm_decrypt
 from .common import (
     Packet, packet2bin, bin2packet, CYC_INT0, CycInt,
-    CONTROL_ACK, CONTROL_PSH, CONTROL_EOF, CONTROL_BCT, 
+    CONTROL_ACK, CONTROL_PSH, CONTROL_EOF, 
     CONTROL_RTM, CONTROL_FIN, MAX_RETRANSMIT_LIMIT, 
     MAX_TEMPORARY_PACKET_SIZE, SEND_BUFFER_SIZE,
     WINDOW_MAX_SIZE, SENDER_SOCKET_WAIT
@@ -79,7 +79,6 @@ FLAG_NAMES = {
     CONTROL_PSH: "PSH",
     CONTROL_EOF: "EOF",
     CONTROL_PSH | CONTROL_EOF: "PSH+EOF",
-    CONTROL_BCT: "BCT",
     CONTROL_RTM: "RTM",
     CONTROL_FIN: "FIN",
 }
@@ -91,7 +90,7 @@ if TYPE_CHECKING:
     from typing import Sized
     _Address = Tuple[Any, ...]
     _WildAddress = Union[_Address, str, bytes]
-    _BroadcastHook = Callable[['Packet', '_Address', 'SecureReliableSocket'], None]
+    _MessageHook = Callable[['Packet', '_Address', 'SecureReliableSocket'], None]
 
 
 def get_formal_address_format(address: '_WildAddress', family: int = s.AF_INET) -> '_Address':
@@ -112,7 +111,7 @@ class SecureReliableSocket():
         "_timeout", "span", "address", "local_address", "shared_key", "mtu_size",
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_time",
         "receiver_seq", "receiver_unread_size", "receiver_socket", "zmq_context", "zmq_push", "zmq_pull", "zmq_endpoint",
-        "broadcast_hook_fnc", "loss", "try_connect", "established", "family", "message_buffer", 
+        "message_hook_fnc", "loss", "try_connect", "established", "family", "message_buffer", 
         "my_public_key", "peer_public_key", "port", "backend", "backend_thread"
     ]
 
@@ -189,9 +188,9 @@ class SecureReliableSocket():
         # Buffer für die Zusammenstellung kompletter Nachrichten
         self.message_buffer = bytearray()
 
-        # broadcast hook
+        # message hook
         # note: don't block this method or backend thread will be broken
-        self.broadcast_hook_fnc: Optional['_BroadcastHook'] = None
+        self.message_hook_fnc: Optional['_MessageHook'] = None
 
         # status
         self.loss = 0
@@ -255,7 +254,7 @@ class SecureReliableSocket():
                 sender_buffer_lock=self.sender_buffer_lock,
                 sender_signal=self.sender_signal,
                 local_address=self.local_address,
-                broadcast_hook_fnc=self.broadcast_hook_fnc,
+                message_hook_fnc=self.message_hook_fnc,
                 peer_public_key=self.peer_public_key
             )
             self.backend_thread = threading.Thread(target=self.backend.run, name="SRMUDP", daemon=True)
@@ -581,11 +580,11 @@ def main() -> None:
                 log.debug("send broadcast!")
             sleep(20)
 
-    def broadcast_hook(packet: Packet, sender_address: '_Address', _sock: SecureReliableSocket) -> None:
+    def message_hook(packet: Packet, sender_address: '_Address', _sock: SecureReliableSocket) -> None:
         sender_str = f"{sender_address[0]}:{sender_address[1]}"
         log.debug("find you!!! from %s (%s)", sender_str, packet)
 
-    sock.broadcast_hook_fnc = broadcast_hook
+    sock.message_hook_fnc = message_hook
     threading.Thread(target=listen).start()
     threading.Thread(target=sending).start()
 

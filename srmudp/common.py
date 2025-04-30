@@ -9,7 +9,6 @@ import logging
 CONTROL_ACK = 0b00000001  # Acknowledge
 CONTROL_PSH = 0b00000010  # Push data immediately
 CONTROL_EOF = 0b00000100  # end of file
-CONTROL_BCT = 0b00001000  # broadcast
 CONTROL_RTM = 0b00010000  # ask retransmission
 CONTROL_FIN = 0b01000000  # fin
 
@@ -100,7 +99,6 @@ class Packet(NamedTuple):
             CONTROL_PSH: "PSH",
             CONTROL_EOF: "EOF",
             CONTROL_PSH | CONTROL_EOF: "PSH+EOF",
-            CONTROL_BCT: "BCT",
             CONTROL_RTM: "RTM",
             CONTROL_FIN: "FIN",
         }

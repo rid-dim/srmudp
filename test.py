@@ -76,29 +76,15 @@ class TestSocket(unittest.TestCase):
         logger.info(f"Asserting sender ({sender}) == sock1.name ({sock1_name})")
         assert sender == sock1_name.replace('0.0.0.0', '127.0.0.1'), (sender, sock1_name)
 
-        # broadcast sending
-        sock2.broadcast(b"good man")
-        #sleep(0.01)
-        logger.info("waiting for receive")
-        result = sock1.receive(timeout=1.0)
-        if not result:
-            self.fail("Keine Broadcast-Nachricht empfangen")
-        sender, received_data, sender_key = result
-        logger.info("received: %s from %s", received_data, sender)
-        if sender_key:
-            logger.info("sender's public key received: %d bytes", len(sender_key))
-        assert received_data == b"good man"
-        assert sender == sock2.getsockname().replace('0.0.0.0', '127.0.0.1'), (sender, sock2.getsockname())
-
-        # broadcast hook fnc
+        # message hook fnc test
         def hook_fnc(packet: Packet, sender_address, _sock: SecureReliableSocket):
-            assert packet.data == b"broadcasting now"
+            assert packet.data == b"message hook test"
             sender_str = f"{sender_address[0]}:{sender_address[1]}"
-            assert sender_str == sock2.getsockname().replace('0.0.0.0', '127.0.0.1'), (sender_str, sock2.getsockname())
+            assert sender_str == sock1.getsockname().replace('0.0.0.0', '127.0.0.1'), (sender_str, sock1.getsockname())
             logger.info("hook fnc called")
             logger.info("hook data: %s", packet.data)
-        sock1.broadcast_hook_fnc = hook_fnc
-        sock2.broadcast(b"broadcasting now")
+        sock2.message_hook_fnc = hook_fnc
+        sock1.send(b"message hook test")
 
         # close
         sock1.close()

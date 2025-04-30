@@ -13,7 +13,7 @@ import zmq
 
 from .common import (
     Packet, packet2bin, bin2packet, CYC_INT0, CycInt,
-    CONTROL_ACK, CONTROL_PSH, CONTROL_EOF, CONTROL_BCT, 
+    CONTROL_ACK, CONTROL_PSH, CONTROL_EOF, 
     CONTROL_RTM, CONTROL_FIN, MAX_RETRANSMIT_LIMIT, 
     MAX_TEMPORARY_PACKET_SIZE, SEND_BUFFER_SIZE
 )
@@ -39,7 +39,7 @@ class ConnectionBackend:
         sender_buffer_lock: threading.Lock,
         sender_signal: threading.Event,
         local_address: Optional[Tuple[str, int]] = None,
-        broadcast_hook_fnc: Optional[Callable] = None,
+        message_hook_fnc: Optional[Callable] = None,
         peer_public_key: Optional[bytes] = None
     ) -> None:
         """
@@ -56,7 +56,7 @@ class ConnectionBackend:
             sender_buffer_lock: Lock for the sender buffer
             sender_signal: Event for signaling sender buffer state
             local_address: Local socket address
-            broadcast_hook_fnc: Function to handle broadcast packets
+            message_hook_fnc: Function to handle incoming messages
             peer_public_key: Public key of the peer
         """
         self.socket = socket
@@ -69,7 +69,7 @@ class ConnectionBackend:
         self.sender_buffer_lock = sender_buffer_lock
         self.sender_signal = sender_signal
         self.local_address = local_address or socket.getsockname()
-        self.broadcast_hook_fnc = broadcast_hook_fnc
+        self.message_hook_fnc = message_hook_fnc
         self.peer_public_key = peer_public_key
         
         # Status and counters
@@ -137,11 +137,11 @@ class ConnectionBackend:
                     # Decrypt and create the packet with the sender address we just saw
                     packet = bin2packet(self._decrypt(data), addr)
                     # Debug output for sender address
-                    log.debug(f"Received packet from {addr[0]}:{addr[1]} (expected peer: {self.address[0]}:{self.address[1]})")
+                    #log.debug(f"Received packet from {addr[0]}:{addr[1]} (expected peer: {self.address[0]}:{self.address[1]})")
 
                 last_receive_time = time()
                 # Log if ACK is received
-                log.debug('Received ACK for sequence %s', packet.sequence)
+                #log.debug('Received ACK for sequence %s', packet.sequence)
             except ValueError:
                 # Log decryption errors
                 log.debug('Decryption failed for packet data: %s', data[:10])
@@ -166,7 +166,7 @@ class ConnectionBackend:
                             log.debug("allow sending operation again seq={}".format(packet.sequence))
                 continue
 
-            # receive reset
+            # note: no ack for FIN packet
             if packet.control & CONTROL_FIN:
                 p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'been notified fin or reset')
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
@@ -187,24 +187,6 @@ class ConnectionBackend:
                     else:
                         log.error("cannot find packet to retransmit seq={}".format(packet.sequence))
                         break
-                continue
-
-            # broadcast packet
-            if packet.control & CONTROL_BCT:
-                # Use the broadcast_hook_fnc if configured
-                if self.broadcast_hook_fnc is not None:
-                    self.broadcast_hook_fnc(packet, packet.sender_address or self.address, self)
-                # Otherwise send the packet directly to the ZeroMQ queue
-                elif last_packet is None or last_packet.control & CONTROL_EOF:
-                    # Send broadcast messages as a complete message
-                    # Add the peer's public key if available
-                    peer_key = None
-                    if hasattr(packet, 'sender_key') and packet.sender_key:
-                        peer_key = packet.sender_key
-                    self._send_complete_message(packet.data, packet.sender_address, peer_key)
-                else:
-                    # note: acquire realtime response
-                    log.debug("throw away %s", packet)
                 continue
 
             """normal packet from here (except PSH, EOF)"""
@@ -237,7 +219,12 @@ class ConnectionBackend:
                 
                 # If EOF or PSH, send the complete message via ZeroMQ
                 if packet.control & CONTROL_EOF:
-                    self._send_complete_message(bytes(message_buffer), packet.sender_address)
+                    # If message_hook_fnc is set, use it for handling the message
+                    if self.message_hook_fnc is not None:
+                        self.message_hook_fnc(packet, packet.sender_address or self.address, self)
+                    # Otherwise send the message directly to the ZeroMQ queue
+                    else:
+                        self._send_complete_message(bytes(message_buffer), packet.sender_address)
                     message_buffer.clear()
             elif packet.sequence > self.receiver_seq:
                 temporary[packet.sequence] = packet
@@ -279,9 +266,8 @@ class ConnectionBackend:
                 last_ack_time = time()
                 # log.debug("pushed! buffer %d %s", len(retransmit_packets), retransmit_packets)
 
-            # reached EOF & push broadcast packets
+            # reached EOF
             if packet.control & CONTROL_EOF:
-                # note: stopped sending broadcast packet after main stream for realtime
                 log.debug("reached end of chunk seq={}".format(packet.sequence))
 
             # update last packet
