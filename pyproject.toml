@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "srmudp"
-version = "0.0.1"
+version = "0.0.2"
 description = ""
 authors = ["rid <rid_dim@gmx.de>"]
 readme = "README.md"
