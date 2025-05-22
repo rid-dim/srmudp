@@ -40,7 +40,8 @@ class ConnectionBackend:
         sender_signal: threading.Event,
         local_address: Optional[Tuple[str, int]] = None,
         message_hook_fnc: Optional[Callable] = None,
-        peer_public_key: Optional[bytes] = None
+        peer_public_key: Optional[bytes] = None,
+        connection_lost_callback: Optional[Callable] = None
     ) -> None:
         """
         Initialize the ConnectionBackend.
@@ -58,6 +59,7 @@ class ConnectionBackend:
             local_address: Local socket address
             message_hook_fnc: Function to handle incoming messages
             peer_public_key: Public key of the peer
+            connection_lost_callback: Callback function to call when connection is lost
         """
         self.socket = socket
         self.zmq_push = zmq_push
@@ -71,6 +73,7 @@ class ConnectionBackend:
         self.local_address = local_address or socket.getsockname()
         self.message_hook_fnc = message_hook_fnc
         self.peer_public_key = peer_public_key
+        self.connection_lost_callback = connection_lost_callback
         
         # Status and counters
         self.is_closed = False
@@ -116,10 +119,16 @@ class ConnectionBackend:
                 self.sendto(self._encrypt(packet2bin(p)), self.address)
                 last_ack_time = time()
 
-            # connection may be broken - send FIN just to notify that i'm closing
+            # connection may be broken - notify parent via callback
             if self.timeout < time() - last_receive_time:
-                p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
-                self.sendto(self._encrypt(packet2bin(p)), self.address)
+                log.info("Connection timeout detected")
+                if self.connection_lost_callback:
+                    # Notify parent about connection loss
+                    self.connection_lost_callback()
+                else:
+                    # Send FIN and break if no callback is set
+                    p = Packet(CONTROL_FIN, CYC_INT0, 0, time(), b'stream may be broken')
+                    self.sendto(self._encrypt(packet2bin(p)), self.address)
                 break
 
             # if no data received, continue

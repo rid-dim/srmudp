@@ -133,7 +133,10 @@ class HolePuncher:
         # 1. UDP hole punching
         sock.sendto(S_HOLE_PUNCHING + punch_msg + curve_name.encode(), address)
 
-        for _ in range(int(timeout / span)):
+        # Retry loop with configurable persistence
+        retry_count = 0
+        
+        while True:
             r, _w, _x = select([sock.fileno()], [], [], span)
             if r:
                 data, _addr = sock.recvfrom(1024)
@@ -205,8 +208,13 @@ class HolePuncher:
                     break
                 else:
                     raise ConnectionError(f"not defined message received {len(data)} bytes")
-        else:
-            raise ConnectionError("timeout on handshake")
+            else:
+                # If no data received, resend hole punch message to keep trying
+                retry_count += 1
+                if retry_count % 10 == 0:  # Log every 10 retries to avoid spam
+                    if logger:
+                        logger.debug(f"Retrying hole punching (attempt {retry_count}) - never giving up")
+                sock.sendto(S_HOLE_PUNCHING + punch_msg + curve_name.encode(), address)
 
         # MTU Discovery
         sock.setsockopt(s.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)

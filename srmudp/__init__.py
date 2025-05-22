@@ -112,15 +112,17 @@ class SecureReliableSocket():
         "sender_seq", "sender_buffer", "sender_signal", "sender_buffer_lock", "sender_time",
         "receiver_seq", "receiver_unread_size", "receiver_socket", "zmq_context", "zmq_push", "zmq_pull", "zmq_endpoint",
         "message_hook_fnc", "loss", "try_connect", "established", "family", "message_buffer", 
-        "my_public_key", "peer_public_key", "port", "backend", "backend_thread"
+        "my_public_key", "peer_public_key", "port", "backend", "backend_thread",
+        "auto_reconnect", "target_address", "reconnect_lock", "is_intentionally_closed"
     ]
 
-    def __init__(self, port: int = 0, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0) -> None:
+    def __init__(self, port: int = 0, family: int = s.AF_INET, timeout: float = 21.0, span: float = 3.0, auto_reconnect: bool = True) -> None:
         """
         :param port: Port to bind the socket to (0 = automatic port selection)
         :param family: socket type AF_INET or AF_INET6
         :param timeout: auto socket close by the time passed (sec)
         :param span: check socket status by the span (sec)
+        :param auto_reconnect: automatically reconnect when connection is lost
         """
     
         self.zmq_context = zmq.Context.instance()
@@ -196,6 +198,12 @@ class SecureReliableSocket():
         self.loss = 0
         self.try_connect = False
         self.established = False
+        
+        # Auto-reconnect functionality
+        self.auto_reconnect = auto_reconnect
+        self.target_address: Optional['_WildAddress'] = None
+        self.reconnect_lock = threading.Lock()
+        self.is_intentionally_closed = False
 
     def __repr__(self) -> str:
         if self.is_closed:
@@ -226,48 +234,114 @@ class SecureReliableSocket():
             host, port_str = address.rsplit(":", 1)
             address = (host, int(port_str))
 
+        # Save target address for auto-reconnect
+        self.target_address = address
+        
         # start communication (only once you can try)
         self.try_connect = True
 
         try:
-            # Verwende HolePuncher für den Verbindungsaufbau
-            holepuncher = HolePuncher(family=self.receiver_socket.family, timeout=self._timeout, span=self.span)
-            shared_key, peer_address, mtu, my_pk, peer_pk = holepuncher.establish_connection(self.receiver_socket, address, logger=log)
-            self.shared_key = shared_key
-            # Log the hashed shared_key for debugging (not the actual key for security reasons)
-            log.debug('Shared key hash: %s', sha256(self.shared_key).hexdigest())
-            self.address = peer_address
-            self.mtu_size = mtu
-            self.my_public_key = my_pk
-            self.peer_public_key = peer_pk
-            log.debug(f"connect success! mtu={self.mtu_size}")
-            
-            # Create and start backend thread
-            self.backend = ConnectionBackend(
-                socket=self.receiver_socket,
-                zmq_push=self.zmq_push,
-                shared_key=self.shared_key,
-                address=self.address,
-                span=self.span, 
-                timeout=self._timeout,
-                sender_buffer=self.sender_buffer,
-                sender_buffer_lock=self.sender_buffer_lock,
-                sender_signal=self.sender_signal,
-                local_address=self.local_address,
-                message_hook_fnc=self.message_hook_fnc,
-                peer_public_key=self.peer_public_key
-            )
-            self.backend_thread = threading.Thread(target=self.backend.run, name="SRMUDP", daemon=True)
-            self.backend_thread.start()
-            
-            self.established = True
+            self._establish_connection_internal(address, is_initial_connect=True)
             atexit.register(self.close)
-            # Log connection establishment details
-            log.debug('Connection established with peer: %s, MTU: %d', self.address, self.mtu_size)
         except Exception as e:
             log.error(f"Connection error: {e}")
-            self.close()
+            self._handle_connection_failure()
             raise
+
+    def _establish_connection_internal(self, address: '_WildAddress', is_initial_connect: bool = False) -> None:
+        """Internal method to establish connection - used by both connect() and _attempt_reconnect()."""
+        # Use HolePuncher for connection establishment
+        holepuncher = HolePuncher(family=self.receiver_socket.family, timeout=self._timeout, span=self.span)
+        shared_key, peer_address, mtu, my_pk, peer_pk = holepuncher.establish_connection(self.receiver_socket, address, logger=log)
+        
+        # Update connection details
+        self.shared_key = shared_key
+        self.address = peer_address
+        self.mtu_size = mtu
+        self.my_public_key = my_pk
+        self.peer_public_key = peer_pk
+        
+        # Log the hashed shared_key for debugging (not the actual key for security reasons)
+        log.debug('Shared key hash: %s', sha256(self.shared_key).hexdigest())
+        log.debug(f"Connection success! mtu={self.mtu_size}")
+        
+        # Close existing backend if it exists (for reconnection)
+        if hasattr(self, 'backend') and self.backend:
+            self.backend.close()
+        
+        # Create and start backend thread
+        self.backend = ConnectionBackend(
+            socket=self.receiver_socket,
+            zmq_push=self.zmq_push,
+            shared_key=self.shared_key,
+            address=self.address,
+            span=self.span, 
+            timeout=self._timeout,
+            sender_buffer=self.sender_buffer,
+            sender_buffer_lock=self.sender_buffer_lock,
+            sender_signal=self.sender_signal,
+            local_address=self.local_address,
+            message_hook_fnc=self.message_hook_fnc,
+            peer_public_key=self.peer_public_key,
+            connection_lost_callback=self._handle_connection_failure
+        )
+        self.backend_thread = threading.Thread(
+            target=self.backend.run, 
+            name="SRMUDP", 
+            daemon=True
+        )
+        self.backend_thread.start()
+        
+        # Set connection status
+        self.established = True
+        if not is_initial_connect:
+            self.try_connect = True
+            
+        # Log connection establishment details
+        log.debug('Connection established with peer: %s, MTU: %d', self.address, self.mtu_size)
+
+    def _handle_connection_failure(self) -> None:
+        """Handle connection failure and attempt auto-reconnect if enabled."""
+        if self.auto_reconnect and not self.is_intentionally_closed and self.target_address:
+            log.info("Connection lost, attempting auto-reconnect...")
+            # Start reconnect attempt in background thread
+            reconnect_thread = threading.Thread(
+                target=self._attempt_reconnect, 
+                name="SRMUDP-Reconnect",
+                daemon=True
+            )
+            reconnect_thread.start()
+        else:
+            self.close()
+
+    def _attempt_reconnect(self) -> None:
+        """Attempt to reconnect to the target address in a background thread."""
+        with self.reconnect_lock:
+            if self.is_intentionally_closed:
+                return
+                
+            # Reset connection state
+            self.established = False
+            self.try_connect = False
+            
+            # Reset sequence numbers and buffers
+            self.sender_seq = CycInt(1)
+            self.receiver_seq = CycInt(1)
+            with self.sender_buffer_lock:
+                self.sender_buffer.clear()
+            self.sender_signal.clear()
+            
+            # Attempt reconnection loop - never give up
+            while not self.is_intentionally_closed:
+                try:
+                    log.info(f"Attempting reconnection to {self.target_address}...")
+                    self._establish_connection_internal(self.target_address, is_initial_connect=False)
+                    log.info(f"Successfully reconnected to {self.address}")
+                    break
+                    
+                except Exception as e:
+                    log.warning(f"Reconnection attempt failed: {e}")
+                    sleep(self.span)  # Wait before next attempt
 
     @property
     def is_closed(self) -> bool:
@@ -278,6 +352,9 @@ class SecureReliableSocket():
         return False
 
     def close(self) -> None:
+        # Mark as intentionally closed to prevent auto-reconnect
+        self.is_intentionally_closed = True
+        
         # Wenn die Verbindung bereits geschlossen ist, nichts tun
         if self.is_closed:
             return
