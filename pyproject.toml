@@ -1,8 +1,8 @@
 [tool.poetry]
 name = "srmudp"
-version = "0.0.3"
+version = "0.0.4"
 description = ""
-authors = ["rid <rid_dim@gmx.de>"]
+authors = ["riddim"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
